@@ -20,38 +20,35 @@ double _g_overcount; // MCMC overcount, needs to be global for simplicity
 // Update the most recent d-graphlet to a random neighbor of it
 int *MCMCGetNeighbor(int *Xcurrent, GRAPH *G)
 {
-    if (mcmc_d == 2)
-    {
-	int oldu = Xcurrent[0];
-	int oldv = Xcurrent[1];
-	while (oldu == Xcurrent[0] && oldv == Xcurrent[1]) {
-	    double p = RandomUniform();
-	    // if 0 < p < 1, p < deg(u) + deg(v) then
-	    if (p < ((double)GraphDegree(G,Xcurrent[0])/(GraphDegree(G,Xcurrent[0]) + GraphDegree(G,Xcurrent[1])))) {
-		// select randomly from Neigh(u) and swap
-		Xcurrent[1] = GraphRandomNeighbor(G, Xcurrent[0]);
-	    }
-	    else {
-		// select randomly from Neigh(v) and swap
-		Xcurrent[0] = GraphRandomNeighbor(G,Xcurrent[1]);
-	    }
-	    if(_sampleSubmethod == SAMPLE_MCMC_EC) {
-		if(!GraphAreConnected(_EDGE_COVER_G, Xcurrent[0], Xcurrent[1]) && RandomUniform() < 0.9) { // undo the attempt
-		    Xcurrent[0] = oldu;
-		    Xcurrent[1] = oldv;
-		}
+    assert(mcmc_d == 2);
+    int oldu = Xcurrent[0];
+    int oldv = Xcurrent[1];
+    while (oldu == Xcurrent[0] && oldv == Xcurrent[1]) {
+	double p = RandomUniform();
+	// if 0 < p < 1, p < deg(u) + deg(v) then
+	if (p < ((double)GraphDegree(G,oldu)/(GraphDegree(G,oldu) + GraphDegree(G,oldv)))) {
+	    // select randomly from Neigh(u) and swap
+	    Xcurrent[1] = GraphRandomNeighbor(G, oldu);
+	}
+	else {
+	    // select randomly from Neigh(v) and swap
+	    Xcurrent[0] = GraphRandomNeighbor(G,oldv);
+	}
+	if(_sampleSubmethod == SAMPLE_MCMC_EC) {
+	    if(!GraphAreConnected(_EDGE_COVER_G, Xcurrent[0], Xcurrent[1]) && RandomUniform() < 0.9) { // undo the attempt
+		Xcurrent[0] = oldu;
+		Xcurrent[1] = oldv;
 	    }
 	}
+    }
 #if PARANOID_ASSERTS
 #if !SELF_LOOPS
-	assert(Xcurrent[0] != Xcurrent[1]);
+    assert(Xcurrent[0] != Xcurrent[1]);
 #endif
-	assert(oldu != Xcurrent[0] || oldv != Xcurrent[1]);
-	assert(oldu != Xcurrent[1] || oldv != Xcurrent[0]);
+    assert(oldu != Xcurrent[0] || oldv != Xcurrent[1]);
+    assert(oldu != Xcurrent[1] || oldv != Xcurrent[0]);
 #endif
-    }
-    else Fatal("Not implemented. Set d to 2");
-	return Xcurrent;
+    return Xcurrent;
 }
 
 // Crawls one step along the graph updating our sliding window
@@ -179,7 +176,7 @@ static int NumReachableNodes(TINY_GRAPH *g, int startingNode)
 // graphlet. We then add all the neighbors of THAT new node to the
 // "one step outside V" set.
 //   If whichCC < 0, then it's really a starting edge, where -1 means edgeList[0], -2 means edgeList[1], etc.
-double SampleGraphletNodeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC)
+double SampleGraphletNodeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC, Accumulators *accums)
 {
     int i, j;
     assert(V && V->maxElem >= G->n);
@@ -215,11 +212,9 @@ double SampleGraphletNodeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int 
     SetAdd(V, Varray[0]);
     SetAdd(V, Varray[1]);
 
-    static SET *outSet;
+    SET *outSet = SetAlloc(G->n);
     int nOut = 0, outbound[G->n]; // vertices one step outside the boundary of V
-    if(!outSet)
-       outSet = SetAlloc(G->n);  // we won't bother to free this since it's static.
-    else if(G->n > outSet->maxElem)
+    if(G->n > outSet->maxElem)
 	SetResize(outSet, G->n);
     else
 	SetEmpty(outSet);
@@ -256,55 +251,8 @@ double SampleGraphletNodeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int 
     for(i=2; i<k; i++)
     {
 	if(nOut == 0) // the graphlet has saturated it's connected component
-	{
-#if PARANOID_ASSERTS
-	    assert(SetCardinality(outSet) == 0);
-	    assert(SetCardinality(V) < k);
-#endif
-#if ALLOW_DISCONNECTED_GRAPHLETS
-	    while(SetIn(V, (j = G->n*RandomUniform()))) ; // must terminate since k <= G->n
-	    outbound[nOut++] = j;
-	    j = 0;
-#else
-	    static int depth;
-	    depth++;
-	    // must terminate eventually as long as there's at least one connected component with >=k nodes.
-	    assert(depth < MAX_TRIES); // graph is too disconnected
-	    SampleGraphletNodeBasedExpansion(G, V, Varray, k, whichCC);
-	    depth--;
-	    // Ensure the damn thing really *is* connected.
-	    TINY_GRAPH *T = TinyGraphAlloc(k);
-	    TinyGraphInducedFromGraph(T, G, Varray);
-#if PARANOID_ASSERTS
-	    assert(NumReachableNodes(T,0) == k);
-#endif
-	    TinyGraphInducedFromGraph(T, G, Varray);
-	    Gint_type Gint = TinyGraph2Int(T, k);
-	    TinyGraphFree(T);
-	    unsigned char perm[k];
-	    memset(perm, 0, k);
-	    Gordinal_type GintOrdinal = ExtractPerm(perm, Gint);
-
-	    double ocount = (double)multiplier/((double)_alphaList[GintOrdinal]);
-	    if (_outputMode == outputODV) {
-		for (j = 0; j < k; j++)
-		    _doubleOrbitDegreeVector[_orbitList[GintOrdinal][j]][Varray[(int)perm[j]]] += ocount;
-	    }
-	    if (_outputMode == outputGDV) {
-		for (j = 0; j < k; j++)
-		    _doubleGraphletDegreeVector[GintOrdinal][Varray[(int)perm[j]]] += ocount;
-	    }
-	    if(ocount < 0) {
-		Warning("ocount (%g) is less than 0\n", ocount);
-	    }
-	    _graphletConcentration[GintOrdinal] += ocount;
-
-	    _g_overcount = ocount;
-	    return 1.0;
-#endif
-	}
-	else
-	    j = nOut * RandomUniform();
+	    Apology("NBE found a connected component with fewer than k nodes; this should be detected earlier!");
+	j = nOut * RandomUniform();
 	if(!_rawCounts) multiplier *= nOut;
 	assert(multiplier > 0.0);
 	int v0 = outbound[j];
@@ -325,31 +273,31 @@ double SampleGraphletNodeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int 
     assert(nOut == SetCardinality(outSet));
 #endif
     if(!_window) {
-	static TINY_GRAPH *g;
-	if(!g) g = TinyGraphAlloc(k);
+	TINY_GRAPH *g = TinyGraphAlloc(k);
 	TinyGraphInducedFromGraph(g, G, Varray);
 	Gint_type Gint = TinyGraph2Int(g, k);
 	unsigned char perm[k];
 	memset(perm, 0, k);
 	Gordinal_type GintOrdinal = ExtractPerm(perm, Gint);
 	double ocount = (double)multiplier/((double)_alphaList[GintOrdinal]);
-	if (_outputMode == outputODV) {
+	if (_outputMode & outputODV) {
 	    for (j = 0; j < k; j++) {
-		_doubleOrbitDegreeVector[_orbitList[GintOrdinal][j]][Varray[(int)perm[j]]] += ocount;
+		accums->orbitDegreeVector[_orbitList[GintOrdinal][j]][Varray[(int)perm[j]]] += ocount;
 	    }
 	}
-	if (_outputMode == outputGDV) {
-		for (j = 0; j < k; j++) {
-		    _doubleGraphletDegreeVector[GintOrdinal][Varray[(int)perm[j]]] += ocount;
-		}
+	if (_outputMode & outputGDV) {
+	    for (j = 0; j < k; j++) {
+        accums->graphletDegreeVector[GintOrdinal][Varray[(int)perm[j]]] += ocount;
+	    }
 	}
 	if(ocount < 0) {
 	Warning("ocount (%g) is less than 0\n", ocount);
 	}
-	_graphletConcentration[GintOrdinal] += ocount;
-
+    accums->graphletConcentration[GintOrdinal] += ocount;
 	_g_overcount = ocount;
+	TinyGraphFree(g);
     }
+    SetFree(outSet);
     return 1.0;
 }
 
@@ -524,7 +472,7 @@ double SampleGraphletFromFile(GRAPH *G, SET *V, unsigned *Varray, int k)
 ** going to remember the total number of edges emanating from every node in
 ** V *including* edges heading back into V, which are techically useless to us.
 ** This sum is just the sum of all the degrees of all the nodes in V.  Call this
-** number "outDegree".  Then, among all the edges emanating out of every node in
+** number "Vdegree".  Then, among all the edges emanating out of every node in
 ** V, we pick a random node from V where the probablity of picking any node v is
 ** proportional to its degree.  Then we pick one of the edges emanating out of v
 ** uniformly at random.  Thus, every edge leaving every node in V has equal
@@ -552,8 +500,14 @@ double SampleGraphletFromFile(GRAPH *G, SET *V, unsigned *Varray, int k)
 ** If whichCC < 0, then it's really a starting edge, where -1 means edgeList[0],
 ** -2 means edgeList[1], etc.
 */
-double SampleGraphletEdgeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC)
+double SampleGraphletEdgeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC, Accumulators *accums)
 {
+    // short-cut set that "remembers" which Vedges are internal as we discover them. Technically this set can be as large
+    // as k*maxDegree, but the number of edges in G is also an upper bound.
+    static _Thread_local SET *internal;
+    if(internal) SetEmpty(internal);
+    else internal = SetAlloc(GraphNumEdges(G));
+
     if(G->useComplement) Fatal("Sorry, EBE not implemented for complemented graphs");
     int edge, v1, v2, numTries = 0;
     assert(V && V->maxElem >= G->n);
@@ -564,35 +518,30 @@ double SampleGraphletEdgeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int 
 	v1 = G->edgeList[2*edge];
 	if(numTries++ > 2*G->numEdges) Fatal("EBE is taking suspiciously long");
     } while(!SetIn(_componentSet[whichCC], v1) || !SetIn(_startNodeSet, v1));
+    assert(edge < G->numEdges);
     v1 = G->edgeList[2*edge];
     v2 = G->edgeList[2*edge+1];
-    assert(edge < G->numEdges);
+    assert(v1 != v2);
     assert(SetIn(_startNodeSet, v1) || SetIn(_startNodeSet, v2));
     SetAdd(V, v1); Varray[0] = v1;
     SetAdd(V, v2); Varray[1] = v2;
     int vCount = 2;
 
-    int outDegree = GraphDegree(G,v1) + GraphDegree(G,v2);
-	int insideEdges = 1, j;
-    static int cumulative[MAX_K];
+    int Vdegree = GraphDegree(G,v1) + GraphDegree(G,v2); // total number of edges emanating out of V so far
+    int insideEdges = 1, j;
+    int cumulative[MAX_K];
     cumulative[0] = GraphDegree(G,v1); // where v1 = Varray[0]
     cumulative[1] = GraphDegree(G,v2) + cumulative[0];
-
-    static SET *internal;	// mark choices of whichNeigh that are discovered to be internal
-    static int Gn;
-    if(!internal) {internal = SetAlloc(G->n); Gn = G->n;}
-    else if(Gn != G->n) {SetFree(internal); internal = SetAlloc(G->n); Gn=G->n;}
-    else SetEmpty(internal);
 
     numTries = 0;
     double multiplier = 1;
     while(vCount < k)
     {
-	int i, whichNeigh, newNode = -1;
+	int i, whichVedge, newNode = -1;
 	while(numTries < MAX_TRIES &&
-	    (whichNeigh = outDegree * RandomUniform()) >= 0 && // always true, just setting whichNeigh
-		SetIn(internal, whichNeigh))
-	    ++numTries; // which edge to choose among all edges leaving all nodes in V so far?
+		(whichVedge = Vdegree * RandomUniform()) >= 0 && // always true, just setting whichVedge
+		SetIn(internal, whichVedge) // "internal" is not complete, but stores edges already known to head back into V
+	    ) ++numTries;
 	if(numTries >= MAX_TRIES) {
 #if ALLOW_DISCONNECTED_GRAPHLETS
 	    // get a new node outside this connected component.
@@ -600,33 +549,34 @@ double SampleGraphletEdgeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int 
 	    while(SetIn(V, (newNode = G->n*RandomUniform())))
 		; // must terminate since k <= G->n
 	    numTries = 0;
-	    outDegree = 0;
+	    Vdegree = 0;
 	    int j;
 	    for(j=0; j<vCount; j++)	// avoid picking these nodes ever again.
 		cumulative[j] = 0;
 	    SetEmpty(internal);
 #else
-	    static int depth;
+	    static _Thread_local int depth; 
+        // static _Thread_local allows each thread to have their own copy of this depth, otherwise there'd be no way to share a static variable for this function
 	    depth++;
 	    assert(depth < MAX_TRIES);
-	    SampleGraphletEdgeBasedExpansion(G, V, Varray, k, whichCC);
+	    SampleGraphletEdgeBasedExpansion(G, V, Varray, k, whichCC, accums);
 	    depth--;
 	    return 1.0;
 #endif
 	}
-	for(i=0; cumulative[i] <= whichNeigh; i++)
-	    ; // figure out whose neighbor it is
-	int localNeigh = whichNeigh-(cumulative[i]-GraphDegree(G,Varray[i])); // which neighbor of node i?
-	if(newNode < 0) newNode = G->neighbor[Varray[i]][localNeigh];
+	for(i=0; cumulative[i] <= whichVedge; i++) ; // figure out whose neighbor it is
+	int localNeigh = whichVedge-(cumulative[i]-GraphDegree(G,Varray[i])); // which neighbor of node i?
+	assert(newNode == -1);
+	newNode = G->neighbor[Varray[i]][localNeigh];
 #if PARANOID_ASSERTS
 	// really should check some of these a few lines higher but let's group all the paranoia in one place.
 	assert(i < vCount);
 	assert(0 <= localNeigh && localNeigh < GraphDegree(G,Varray[i]));
 	assert(0 <= newNode && newNode < G->n);
 #endif
-	if(SetIn(V, newNode))
+	if(SetIn(V, newNode)) // we've failed to find a new node, it's already in V
 	{
-	    SetAdd(internal, whichNeigh);
+	    SetAdd(internal, whichVedge); // add "whichVedge" to the list of "known" internal edges
 	    if(++numTries < MAX_TRIES)
 		continue;
 	    else // graph is too disconnected
@@ -642,33 +592,31 @@ double SampleGraphletEdgeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int 
 		while(SetIn(V, (newNode = G->n*RandomUniform())))
 		    ; // must terminate since k <= G->n
 		numTries = 0;
-		outDegree = 0;
+		Vdegree = 0;
 		int j;
 		for(j=0; j<vCount; j++)	// avoid picking these nodes ever again.
 		    cumulative[j] = 0;
 		SetEmpty(internal);
 #else
-		static int depth;
-		depth++;
-		assert(depth < MAX_TRIES);
-		SampleGraphletEdgeBasedExpansion(G, V, Varray, k, whichCC);
-		depth--;
+        // _Thread_local gives each thread their own copy of the depth variable
+        static _Thread_local int depth; 
+        depth++;
+        assert(depth < MAX_TRIES);
+        SampleGraphletEdgeBasedExpansion(G, V, Varray, k, whichCC, accums);
+        depth--;
 		return 1.0;
 #endif
 	    }
 	}
-	multiplier *= (outDegree - 2*insideEdges);
+	multiplier *= (Vdegree - 2*insideEdges);
 	SetAdd(V, newNode);
 	cumulative[vCount] = cumulative[vCount-1] + GraphDegree(G,newNode);
 	Varray[vCount++] = newNode;
-	outDegree += GraphDegree(G,newNode);
-	if(vCount < k) {
-		for(j = 0; j < vCount-1; j++) 
-			if(GraphAreConnected(G, Varray[j], newNode)) insideEdges++;
-	}
+	Vdegree += GraphDegree(G,newNode);
+	if(vCount < k) for(j = 0; j < vCount-1; j++) if(GraphAreConnected(G, Varray[j], newNode)) insideEdges++;
 #if PARANOID_ASSERTS
 	assert(SetCardinality(V) == vCount);
-	assert(outDegree == cumulative[vCount-1]);
+	assert(Vdegree == cumulative[vCount-1]);
 #endif
     }
 #if PARANOID_ASSERTS
@@ -683,21 +631,24 @@ double SampleGraphletEdgeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int 
 	memset(perm, 0, k);
 	Gordinal_type GintOrdinal = ExtractPerm(perm, Gint);
 	double ocount = (double)multiplier/((double)_alphaList[GintOrdinal]);
-	if (_outputMode == outputODV) {
-	    for (j = 0; j < k; j++)
-		_doubleOrbitDegreeVector[_orbitList[GintOrdinal][j]][Varray[(int)perm[j]]] += ocount;
+	if (_outputMode & outputODV) {
+	    for (j = 0; j < k; j++) {
+		accums->orbitDegreeVector[_orbitList[GintOrdinal][j]][Varray[(int)perm[j]]] += ocount;
+	    }
 	}
-	if (_outputMode == outputGDV) {
-	    for (j = 0; j < k; j++)
-		_doubleGraphletDegreeVector[GintOrdinal][Varray[(int)perm[j]]] += ocount;
+	if (_outputMode & outputGDV) {
+	    for (j = 0; j < k; j++) {
+        accums->graphletDegreeVector[GintOrdinal][Varray[(int)perm[j]]] += ocount;
+	    }
 	}
 	if(ocount < 0) {
 	    Warning("ocount (%g) is less than 0\n", ocount);
 	}
-	_graphletConcentration[GintOrdinal] += ocount;
+	accums->graphletConcentration[GintOrdinal] += ocount;
 
 	_g_overcount = ocount;
     }
+
     return 1.0;
 }
 
@@ -860,7 +811,7 @@ double SampleGraphletLuBressanReservoir(GRAPH *G, SET *V, unsigned *Varray, int 
 
 // foundGraphletCount is the expected count of the found graphlet (multiplier/_alphaList[GintOrdinal]),
 // which needs to be returned (but must be a parameter since there's already a return value on the function)
-double SampleGraphletMCMC(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC) {
+double SampleGraphletMCMC(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC, Accumulators *accums) {
     static Boolean setup = false;
     static int currSamples = 0; // Counts how many samples weve done at the current starting point
     static int currEdge = 0; // Current edge we are starting at for uniform sampling
@@ -874,7 +825,7 @@ double SampleGraphletMCMC(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC
 	XLS = MultisetAlloc(G->n);
 	g = TinyGraphAlloc(k);
     }
-
+    // SYNTH: currentOrdinal =....
     // The first time we run this, or when we restart. We want to find our initial L d graphlets.
     if (!setup && !_MCMC_EVERY_EDGE) {
 	setup = true;
@@ -938,6 +889,13 @@ double SampleGraphletMCMC(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC
     unsigned char perm[k];
     memset(perm, 0, k);
     Gordinal_type GintOrdinal = ExtractPerm(perm, Gint);
+    // SYNTH: this is where the new ordinal graphlet ID is computed
+#if SYNTHETIC // Akhil: hints here
+    static int prevOrdinal;
+    printf("ordinal transition %d -> %d\n", prevOrdinal, GintOrdhinal);
+    ++transitionCount[prevOrdinal][GintOrdinal];
+    prevOrdinal = GintOrdinal;
+#endif
 
     assert(numNodes == k); // Ensure we are returning k nodes
     Boolean found=false;
@@ -959,29 +917,31 @@ double SampleGraphletMCMC(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC
 	// The over counting ratio is the alpha value divided by the multiplier
 	ocount = (double)multiplier/((double)_alphaList[GintOrdinal]);
     }
-    if (_outputMode == outputODV) {
+    if (_outputMode & outputODV) {
 	for (j = 0; j < k; j++)
-	    _doubleOrbitDegreeVector[_orbitList[GintOrdinal][j]][Varray[(int)perm[j]]] += ocount;
+	    accums->orbitDegreeVector[_orbitList[GintOrdinal][j]][Varray[(int)perm[j]]] += ocount;
     }
-    if (_outputMode == outputGDV) {
+    if (_outputMode & outputGDV) {
 	for (j = 0; j < k; j++)
-	    _doubleGraphletDegreeVector[GintOrdinal][Varray[(int)perm[j]]] += ocount;
+	    accums->graphletDegreeVector[GintOrdinal][Varray[(int)perm[j]]] += ocount;
     }
     if(ocount < 0) {
 	Warning("ocount (%g) is less than 0\n", ocount);
     }
-    _graphletConcentration[GintOrdinal] += ocount;
+    accums->graphletConcentration[GintOrdinal] += ocount;
 
+    // SYNTH: increment row[old], column[new] by 1
     _g_overcount = ocount;
     return 1.0;
 }
 
 
 
+#if 0 // SEC no longer supported
 // SampleGraphletSequentialEdgeChaining starts with a single edge and always chooses a new edge that shares one node
 // with the previous edge and has another new node. If it get's stuck having no edges with new node to choose, it restarts
-// After And after choosing k-1 edges it returns a graphlet
-double SampleGraphletSequentialEdgeChaining(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC) {
+// After And after choosing k-1 edges it returns a graphlet. NON-REENTRANT AND CANNOT BE MULTITHREADED
+double SampleGraphletSequentialEdgeChaining(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC, Accumulators *accums) {
     static int Xcurrent[2]; // holds the most recent edge
     static TINY_GRAPH *g = NULL; // Tinygraph for computing overcounting;
     if (!g) {
@@ -1101,22 +1061,23 @@ double SampleGraphletSequentialEdgeChaining(GRAPH *G, SET *V, unsigned *Varray, 
     // The over counting ratio is the alpha value divided by the multiplier
     ocount = (double)multiplier/((double)_alphaList[GintOrdinal]);
 
-    if (_outputMode == outputODV) {
+    if (_outputMode & outputODV) {
 	for (j = 0; j < k; j++)
-	    _doubleOrbitDegreeVector[_orbitList[GintOrdinal][j]][Varray[(int)perm[j]]] += ocount;
+	    accums->orbitDegreeVector[_orbitList[GintOrdinal][j]][Varray[(int)perm[j]]] += ocount;
     }
-    if (_outputMode == outputGDV) {
+    if (_outputMode & outputGDV) {
 	for (j = 0; j < k; j++)
-	    _doubleGraphletDegreeVector[GintOrdinal][Varray[(int)perm[j]]] += ocount;
+	    accums->graphletDegreeVector[GintOrdinal][Varray[(int)perm[j]]] += ocount;
     }
     if(ocount < 0) {
 	Warning("ocount (%g) is less than 0\n", ocount);
     }
-    _graphletConcentration[GintOrdinal] += ocount;
+    accums->graphletConcentration[GintOrdinal] += ocount;
 
     _g_overcount = ocount;
     return 1.0;
 }
+#endif
 
 
 double SampleGraphletLuBressan_MCMC_MHS_without_Ooze(GRAPH *G, SET *V, unsigned *Varray, int k) { return 1.0; } // slower
@@ -1216,8 +1177,9 @@ void SampleGraphletIndexAndPrint(GRAPH* G, unsigned *prev_nodes_array, int prev_
         // ProcessGraphlet creates the k-node induced graphlet from prev_nodes_array, and then determine if said graphlet is of
         // low enough multiplicity (<= multiplicity); it will also check that the k nodes you passed it haven't already been
         // printed (although, this system does not work 100% perfectly); it will also print the nodes as output if
-	// the graphlet passes all checks
-        ProcessGraphlet(G, NULL, prev_nodes_array, _k, g, 0.0);
+	    // the graphlet passes all checks
+        static Accumulators trash;
+        ProcessGraphlet(G, NULL, prev_nodes_array, _k, g, 0.0, &trash);
         return; // return here since regardless of whether ProcessGraphlet has passed or not, prev_nodes_array is already of size k so we should terminate the recursion
     }
 
@@ -1313,7 +1275,7 @@ void SampleGraphletIndexAndPrint(GRAPH* G, unsigned *prev_nodes_array, int prev_
 
 
 // if cc == G->n, then we choose it randomly. Otherwise use cc given.
-double SampleGraphlet(GRAPH *G, SET *V, unsigned Varray[], int k, int cc) {
+double SampleGraphlet(GRAPH *G, SET *V, unsigned Varray[], int k, int cc, Accumulators *accums) {
     double randomComponent = RandomUniform();
     if(cc == G->n) for(cc=0; cc<_numConnectedComponents;cc++)
 	if(_cumulativeProb[cc] > randomComponent)
@@ -1324,11 +1286,9 @@ double SampleGraphlet(GRAPH *G, SET *V, unsigned Varray[], int k, int cc) {
 	SampleGraphletAcceptReject(G, V, Varray, k);	// REALLY REALLY SLOW and doesn't need to use cc
 	break;
     case SAMPLE_NODE_EXPANSION:
-	SampleGraphletNodeBasedExpansion(G, V, Varray, k, cc);
+	SampleGraphletNodeBasedExpansion(G, V, Varray, k, cc, accums);
 	break;
-    case SAMPLE_SEQUENTIAL_CHAINING:
-	SampleGraphletSequentialEdgeChaining(G, V, Varray, k, cc);
-	break;
+    // case SAMPLE_SEQUENTIAL_CHAINING: Apology("SEC is no longer supported due to fundamentally unfixable problems with the method"); break;
     case SAMPLE_FAYE:
 	SampleGraphletFaye(G, V, Varray, k, cc);
 	break;
@@ -1336,11 +1296,11 @@ double SampleGraphlet(GRAPH *G, SET *V, unsigned Varray[], int k, int cc) {
 	SampleGraphletLuBressanReservoir(G, V, Varray, k, cc); // pretty slow but not as bad as unbiased
 	break;
     case SAMPLE_EDGE_EXPANSION:
-	SampleGraphletEdgeBasedExpansion(G, V, Varray, k, cc); // Faster than NBE but less well tested and understood.
+	SampleGraphletEdgeBasedExpansion(G, V, Varray, k, cc, accums); // Faster than NBE but less well tested and understood.
 	break;
     case SAMPLE_MCMC:
         if(!_window) {
-	    SampleGraphletMCMC(G, V, Varray, k, cc);
+	    SampleGraphletMCMC(G, V, Varray, k, cc, accums);
         } else {
             SampleWindowMCMC(G, V, Varray, k, cc);
         }

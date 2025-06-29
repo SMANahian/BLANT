@@ -17,7 +17,7 @@ Gordinal_type* _K;
 
 void SetGlobalCanonMaps(int k){
     assert(3 <= k && k <= 8);
-    unsigned int _Bk = (1 <<(k*(k-1)/2));
+    unsigned int _Bk = (1U <<(k*(k-1)/2));
     char BUF[BUFSIZ];
     Gint_type _canonList[MAX_CANONICALS];
     char _canonNumEdges[MAX_CANONICALS];
@@ -25,7 +25,7 @@ void SetGlobalCanonMaps(int k){
     _numCanon = _connectedCanonicals->maxElem;
     _K = (Gordinal_type*) mapCanonMap(BUF, _K, k);
 
-    sprintf(BUF, CANON_DIR "/perm_map%d.bin", k);
+    sprintf(BUF, "%s/perm_map%d.bin", _CANON_DIR, k);
 }
 
 int getHammingDistance(int a, int b){

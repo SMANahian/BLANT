@@ -10,6 +10,8 @@
 #include <math.h>
 #include <limits.h>
 #include <signal.h>
+#include <pthread.h>
+#include <stdbool.h>
 #include "misc.h"
 #include "tinygraph.h"
 #include "graph.h"
@@ -24,12 +26,40 @@
 #include "blant-utils.h"
 #include "blant-sampling.h"
 #include "blant-synth-graph.h"
+#include "blant-pthreads.h"
 #include "rand48.h"
 Boolean _earlyAbort; // Can be set true by anybody anywhere, and they're responsible for producing a warning as to why
 #include "blant-predict.h"
 #include "importance.h"
 #include "odv.h"
 #include "stats.h"
+
+// define random variable algorithm
+#define USE_MarsenneTwister 0
+#if USE_MarsenneTwister
+#include "../C++/mt19937.h" // not yet implemented correctly
+_Thread_local MT19937 *mt19937Seed;
+void RandomSeed(long seed) {
+    if(mt19937Seed) Mt19937Free(mt19937Seed);
+    mt19937Seed = Mt19937Alloc(seed);
+}
+double RandomUniform(void) {
+    return Mt19937NextDouble(mt19937Seed);
+}
+#else
+#include "rand48.h"
+_Thread_local unsigned short erand48Seed[3];
+void RandomSeed(long seed) {
+    // split the number seed into 3 portions of 16 bits
+    erand48Seed[0] = (unsigned short)(seed & 0xFFFF);         // Lower 16 bits
+    erand48Seed[1] = (unsigned short)((seed >> 16) & 0xFFFF); // Middle 16 bits
+    erand48Seed[2] = 0x330E; // Upper 16 bits, set to this to mimic srand48
+}
+double RandomUniform(void) {
+    return erand48(erand48Seed);
+}
+#endif
+
 
 static int _numNodes, _numEdges, _maxEdges=1024, _seed = -1; // -1 means "not initialized"
 static unsigned *_pairs;
@@ -58,7 +88,6 @@ Gint_type _canonList[MAX_CANONICALS]; // map ordinals to integer representation 
 SET *_connectedCanonicals; // the SET of canonicals that are connected.
 SET ***_communityNeighbors;
 char _communityMode; // 'g' for graphlet or 'o' for orbit
-char _communityMode; // 'g' for graphlet or 'o' for orbit
 Boolean _useComplement; // to use the complement graph (DEPRECATED, FIND ANOTHER LETTER)
 Boolean _weighted; // input network is weighted
 Boolean _rawCounts;
@@ -72,8 +101,6 @@ Gint_type _numOrbits, _orbitList[MAX_CANONICALS][MAX_K]; // map from [ordinal][c
 Gordinal_type _orbitCanonMapping[MAX_ORBITS]; // Maps orbits to canonical (including disconnected)
 char _orbitCanonNodeMapping[MAX_ORBITS]; // Maps orbits to canonical (including disconnected)
 int *_whichComponent;
-
-// char* _BLANT_DIR;
 
 enum OutputMode _outputMode = undef;
 unsigned long _numSamples;
@@ -96,9 +123,7 @@ int _numConnectedOrbits;
 // the first dimension, otherwise we'd need to get more funky with the pointer allocation.
 // Only one of these actually get allocated, depending upon outputMode.
 double *_graphletDegreeVector[MAX_CANONICALS];
-double    *_orbitDegreeVector[MAX_ORBITS];
-double *_doubleGraphletDegreeVector[MAX_CANONICALS];
-double *_doubleOrbitDegreeVector[MAX_ORBITS];
+double *_orbitDegreeVector[MAX_ORBITS];
 
 double *_cumulativeProb, _worstPrecision, _meanPrec;
 enum PrecisionMode _precisionMode = mean;
@@ -107,8 +132,6 @@ int _worstCanon=-1;
 
 double _desiredDigits, _desiredPrec, _confidence;
 
-// number of parallel threads required, and the maximum allowed at one time.
-int _JOBS, _MAX_THREADS;
 
 // Here's the actual mapping from non-canonical to canonical, same argument as above wasting memory, and also mmap'd.
 // So here we are allocating 256MB x sizeof(short int) = 512MB.
@@ -121,6 +144,11 @@ Gordinal_type *_K = NULL; // Allocating memory dynamically
 static unsigned int **_componentList; // list of lists of components, largest to smallest.
 static double _totalCombinations, *_combinations, *_probOfComponent;
 SET **_componentSet;
+
+// number of parallel threads required, and the maximum allowed at one time (set to sysconf(_SC_NPROCESSORS_ONLN) later in main).
+int _numThreads, _maxThreads;
+Accumulators _trashAccumulator = {};
+enum StopMode _stopMode;
 
 double GetCPUseconds(void) {
     struct rusage usg;
@@ -138,12 +166,6 @@ double GetCPUseconds(void) {
         return -1;
     }
     return res;
-}
-
-void SetBlantDir(void) {
-    char* temp = getenv("BLANT_DIR");
-    if (temp != NULL)
-	_BLANT_DIR = strdup(temp); // can't assume the string returned by getetv never changes, so copy it.
 }
 
 #define O_ALLOC 1
@@ -238,7 +260,7 @@ static void InitializeStarMotifs(GRAPH *G) {
 const char *SampleMethodStr(void) {
     switch(_sampleMethod) {
     case SAMPLE_NODE_EXPANSION: return "NBE"; break;
-    case SAMPLE_SEQUENTIAL_CHAINING: return "SEC"; break;
+    // case SAMPLE_SEQUENTIAL_CHAINING: return "SEC"; break;
     case SAMPLE_FAYE: return "FAYE"; break;
     case SAMPLE_EDGE_EXPANSION: return "EBE"; break;
     case SAMPLE_MCMC:
@@ -264,11 +286,11 @@ Gint_type alphaListPopulate(char *BUF, Gint_type *alpha_list, int k) {
     }
 
     if(_sampleMethod == SAMPLE_NODE_EXPANSION) {
-	    sprintf(BUF, "%s/%s/alpha_list_nbe%d.txt", _BLANT_DIR, CANON_DIR, k);
+	    sprintf(BUF, "%s/%s/alpha_list_NBE%d.txt", _BLANT_DIR, _CANON_DIR, k);
     } else if(_sampleMethod == SAMPLE_EDGE_EXPANSION) {
-	    sprintf(BUF, "%s/%s/alpha_list_ebe%d.txt", _BLANT_DIR, CANON_DIR, k);
+	    sprintf(BUF, "%s/%s/alpha_list_EBE%d.txt", _BLANT_DIR, _CANON_DIR, k);
     } else {
-	    sprintf(BUF, "%s/%s/alpha_list_mcmc%d.txt", _BLANT_DIR, CANON_DIR, k);
+	    sprintf(BUF, "%s/%s/alpha_list_MCMC%d.txt", _BLANT_DIR, _CANON_DIR, k);
     }
     FILE *fp_ord=fopen(BUF, "r");
     if(!fp_ord) Fatal("cannot find %s\n", BUF);
@@ -284,7 +306,7 @@ Gint_type alphaListPopulate(char *BUF, Gint_type *alpha_list, int k) {
     return numAlphas;
 }
 
-// Loads alpha values(overcounting ratios) for NBE/SEC/EBE/MCMC sampling from files
+// Loads alpha values(overcounting ratios) for NBE/EBE/MCMC sampling from files
 // The alpha value represents the number of ways to get that graphlet
 // Concentrations are initialized to 0
 void initialize(GRAPH* G, int k, unsigned long numSamples) {
@@ -318,7 +340,7 @@ void initializeMCMC(GRAPH* G, int k, unsigned long numSamples) {
 
 	_numSamples = numSamples;
 	if(!_window) {
-		initialize(G, k, numSamples);
+	    initialize(G, k, numSamples);
 	}
 }
 
@@ -333,15 +355,14 @@ void finalize(GRAPH *G, unsigned long numSamples) {
     }
     if(totalConcentration) for (i = 0; i < _numCanon; i++) _graphletConcentration[i] /= totalConcentration;
 
-    if(_outputMode == outputODV)
+    if(_outputMode & outputODV)
 	for(i=0;i<_numOrbits;i++)
 	    for(j=0;j<G->n;j++)
-		_doubleOrbitDegreeVector[i][j] *= numSamples/totalConcentration;
-
-    if(_outputMode == outputGDV)
+		_orbitDegreeVector[i][j] *= numSamples/totalConcentration;
+    if(_outputMode & outputGDV)
 	for(i=0;i<_numCanon;i++)
 	    for(j=0;j<G->n;j++)
-		_doubleGraphletDegreeVector[i][j] *= numSamples/totalConcentration;
+		_graphletDegreeVector[i][j] *= numSamples/totalConcentration;
 }
 
 #if 0 // unused code, commented out to shut up the compiler
@@ -407,14 +428,15 @@ static int StateDegree(GRAPH *G, SET *S)
 }
 #endif
 
-// This converts graphlet frequencies to concentrations or integers based on the sampling algorithm and command line arguments
+// This function is usually only run at the END after all sampling is finished; it converts graphlet frequencies to
+// concentrations or integers based on the sampling algorithm and command line arguments.
 // It returns an estimate of the total number of connected graphlets in the entire graph
 void convertFrequencies(unsigned long numSamples)
 {
     int i;
     assert(numSamples);
     switch(_sampleMethod) {
-    case SAMPLE_MCMC: case SAMPLE_NODE_EXPANSION: case SAMPLE_SEQUENTIAL_CHAINING: case SAMPLE_EDGE_EXPANSION:
+    case SAMPLE_MCMC: case SAMPLE_NODE_EXPANSION: case SAMPLE_EDGE_EXPANSION: //case SAMPLE_SEQUENTIAL_CHAINING:
 	if (_freqDisplayMode == freq_display_mode_count || _freqDisplayMode == freq_display_mode_estimate_absolute) {
 	    double totalConcentration = 0;
 	    for (i = 0; i < _numCanon; i++) assert(_graphletConcentration[i] >= 0.0 && !isinf(_graphletConcentration[i]));
@@ -438,7 +460,7 @@ double computeAbsoluteMultiplier(unsigned long numSamples)
 {
     int i;
     double total=0;
-    if (_sampleMethod == SAMPLE_MCMC || _sampleMethod == SAMPLE_NODE_EXPANSION || _sampleMethod == SAMPLE_SEQUENTIAL_CHAINING || _sampleMethod == SAMPLE_EDGE_EXPANSION) {
+    if (_sampleMethod == SAMPLE_MCMC || _sampleMethod == SAMPLE_NODE_EXPANSION || _sampleMethod == SAMPLE_EDGE_EXPANSION) {
 	long double foundStars = 0;
 	for (i = 0; i < _numCanon; i++)
 	    if(_canonNumStarMotifs[i] != -1) foundStars += _graphletCount[i]*_canonNumStarMotifs[i];
@@ -456,16 +478,86 @@ double computeAbsoluteMultiplier(unsigned long numSamples)
 }
 
 
+
+void* RunBlantInThread(void* arg) {
+    // variable unpacking
+    ThreadData* args = (ThreadData*)arg;
+    // honestly some of this data can just be accessed via global variables
+    int k = args->k;
+    GRAPH *G = args->G;
+    int varraySize = args->varraySize;
+    long seed = args->seed;
+    int threadId = args->threadId;
+    int samplesPerThread = args->samplesPerThread;
+    Accumulators *accums = args->accums;
+
+    // initialize the random number generator
+    RandomSeed(seed);
+    RandomUniform();
+
+#if PARANOID_ASSERTS
+    for (int i = 0; i < _numCanon; i++) {
+        // printf("graphletConcentration[%d] = %g\n", i, accums->graphletConcentration[i]);
+        assert(accums->graphletConcentration[i] == 0);
+    }
+
+#endif
+
+    SET *V = SetAlloc(G->n);
+    TINY_GRAPH *empty_g = TinyGraphAlloc(k);
+    unsigned Varray[varraySize];
+    double weight;
+    unsigned long stuck = 0;
+    SET *prev_node_set = SetAlloc(G->n);
+    SET *intersect_node = SetAlloc(G->n);
+
+    if (_outputMode & graphletDistribution) {
+        SampleGraphlet(G, V, Varray, k, G->n, &_trashAccumulator);
+        SetCopy(prev_node_set, V);
+        TinyGraphInducedFromGraph(empty_g, G, Varray);
+    }
+
+    for (int i = 0; i < samplesPerThread; i++) {
+        if (_window) {
+            Fatal("Multithreading not yet implemented for any window related output modes."); // needs to be done
+        } 
+        if (_outputMode & graphletDistribution) {
+            // calls SampleGraphlet internally  
+            ProcessWindowDistribution(G, V, Varray, k, empty_g, prev_node_set, intersect_node);
+        } else {
+            weight = SampleGraphlet(G, V, Varray, k, G->n, accums);
+            if (ProcessGraphlet(G, V, Varray, k, empty_g, weight, accums)) {
+                stuck = 0; // reset stuck counter when finding a newly processed graphlet
+            } else {
+                // processing failed, ignore sample
+                i--;
+                stuck++;
+                if(stuck > MAX(G->n, _numSamples)) {
+                    if(_quiet<2) Warning("Sampling aborted for thread %d: no new graphlets discovered after %d attempts", threadId, stuck);
+                    break;
+                }
+            }
+        }
+    }
+    SetFree(prev_node_set);
+    SetFree(intersect_node);
+    SetFree(V);
+    TinyGraphFree(empty_g);
+    pthread_exit(0);
+}
+
+
 // This is the single-threaded BLANT function. YOU PROBABLY SHOULD NOT CALL THIS.
-// Call RunBlantInThreads instead, it's the top-level entry point to call once the
-// graph is finished being input---all the ways of reading input call RunBlantInThreads.
+// Call RunBlantInForks (or RunBlantInThread) instead, it's the top-level entry point to call
+// once the graph is finished being input---all the ways of reading input call RunBlantIn(Forks|Threads).
 // Note it does stuff even if numSamples == 0, because we may be the parent of many
 // threads that finished and we have nothing to do except output their accumulated results.
-static int RunBlantFromGraph(int k, unsigned long numSamples, GRAPH *G)
-{
+static int RunBlantFromGraph(int k, unsigned long numSamples, GRAPH *G) {
     int windowRepInt, D;
+    unsigned long i, j;
     unsigned char perm[MAX_K+1];
     assert(k <= G->n);
+    assert(k == _k);
     SET *V = SetAlloc(G->n);
     SET *prev_node_set = SetAlloc(G->n);
     SET *intersect_node = SetAlloc(G->n);
@@ -478,22 +570,64 @@ static int RunBlantFromGraph(int k, unsigned long numSamples, GRAPH *G)
     unsigned Varray[varraySize];
     InitializeConnectedComponents(G);
     InitializeStarMotifs(G);
+
+
+    // these initialize the global accumulators, which are the ones being outputed
+    // each thread also has it's own copy of accumulators, which are then "summed up" into this global copy we initialize below
+    // initialize GDV vectors if needed
+    if(_outputMode & outputGDV || (_outputMode & communityDetection && _communityMode=='g')) {
+        for(i=0;i<_numCanon;i++) {
+            _graphletDegreeVector[i] = Ocalloc(G->n, sizeof(**_graphletDegreeVector));
+            for(j=0;j<G->n;j++) _graphletDegreeVector[i][j]=0.0;
+        }
+    }
+    // initialize ODV vectors if needed
+    if(_outputMode & outputODV || (_outputMode & communityDetection && _communityMode=='o')) {
+        for(i=0;i<_numOrbits;i++) {
+            _orbitDegreeVector[i] = Ocalloc(G->n, sizeof(**_orbitDegreeVector));
+            for(j=0;j<G->n;j++) _orbitDegreeVector[i][j]=0.0;
+        }
+    } // note that this double allocation of GDV/ODV vectors may slow things down
+
+
+    // initialize distribution tables if needed
+    if (_outputMode & graphletDistribution) {
+        _graphletDistributionTable = Ocalloc(_numCanon, sizeof(int*));
+        for(i=0; i<_numCanon; i++) _graphletDistributionTable[i] = Ocalloc(_numCanon, sizeof(int));
+        for(i=0; i<_numCanon; i++) for(j=0; j<_numCanon; j++) _graphletDistributionTable[i][j] = 0;
+    }
+
+    if(_outputMode & predict) Predict_Init(G);
+
+    // initiailize graphlet count/concentrations since they contain garbage
+    for (i = 0; i < _numCanon; i++) {
+        _graphletConcentration[i] = 0;
+        _graphletCount[i] = 0;
+    }
+    
     if (_sampleMethod == SAMPLE_MCMC)
 	_window? initializeMCMC(G, _windowSize, numSamples) : initializeMCMC(G, k, numSamples);
-    else if (_sampleMethod == SAMPLE_NODE_EXPANSION || _sampleMethod == SAMPLE_SEQUENTIAL_CHAINING || _sampleMethod == SAMPLE_EDGE_EXPANSION)
+    else if (_sampleMethod == SAMPLE_NODE_EXPANSION || _sampleMethod == SAMPLE_EDGE_EXPANSION)
 	initialize(G, k, numSamples);
-    if (_outputMode == graphletDistribution) {
-        SampleGraphlet(G, V, Varray, k, G->n);
+    if (_outputMode & graphletDistribution) {
+        // accumulators must be provided but no need for them
+        SampleGraphlet(G, V, Varray, k, G->n, &_trashAccumulator);
         SetCopy(prev_node_set, V);
         TinyGraphInducedFromGraph(empty_g, G, Varray);
     }
 
+    // if sample method is SAMPLE_INDEX or MCMC, and NOT index output
     if ((_sampleMethod == SAMPLE_INDEX || _sampleSubmethod == SAMPLE_MCMC_EC) &&
-	(_outputMode != indexGraphlets && _outputMode != indexGraphletsRNO && _outputMode != indexOrbits))
+	!(_outputMode & indexGraphlets) && !(_outputMode & indexGraphletsRNO) && !(_outputMode & indexOrbits))
 	    Fatal("currently only -mi and -mj output modes are supported for INDEX and EDGE_COVER sampling methods");
 
+    // ethan note: nothing written about SAMPLE_INDEX sampling, but it must be single threaded?
     if (_sampleMethod == SAMPLE_INDEX) {
-	int i;
+        if (_numThreads > 1) {
+            Note("Index sampling must be single threaded, thus only one thread will be ran.");
+            _numThreads = 1; // this is unecessary since the below code doesn't use _numThreads at all, but keep anyway
+        }
+
         unsigned prev_nodes_array[_k];
 
         // Get heuristic values based on orbit number, if ODV file provided
@@ -533,7 +667,7 @@ static int RunBlantFromGraph(int k, unsigned long numSamples, GRAPH *G)
                 fprintf(stderr, "%d%% done\n", percentToPrint);
                 ++percentToPrint;
             }
-	}
+	    }
     }
     else if (_sampleMethod == SAMPLE_MCMC_EC) {
 	Fatal("should not get here--EDGE_COVER is a submethod of MCMC");
@@ -563,13 +697,140 @@ static int RunBlantFromGraph(int k, unsigned long numSamples, GRAPH *G)
 	}
 #endif
     }
-    else // sample graphlets from entire graph using either numSamples or confidence
+    else if (
+        // sampling methods in which non-reentrancy has been implemented with the Accumulators struct
+        // doesn't necessarily mean that they can be ran in multiple threads (MCMC)
+        _sampleMethod == SAMPLE_EDGE_EXPANSION || _sampleMethod == SAMPLE_NODE_EXPANSION ||
+        _sampleMethod == SAMPLE_MCMC
+    ) {
+        // Apologize if _numThreads > 1 for a sampling method or output mode that isn't yet supported by multithreading
+        if (
+            _numThreads > 1 && (
+            !(_outputMode & graphletFrequency || _outputMode & outputGDV || _outputMode & outputODV || 
+                // index modes have nothing to accumulate, thus work very easily with multithreading
+              _outputMode & indexGraphlets || _outputMode & indexGraphletsRNO || _outputMode & indexOrbits ||
+              _outputMode & indexMotifs || _outputMode & indexMotifOrbits || _outputMode & communityDetection
+            ) ||
+            !(_sampleMethod == SAMPLE_EDGE_EXPANSION || _sampleMethod == SAMPLE_NODE_EXPANSION)
+            )
+        ) {
+            Note("Multithreading (t=%d) not supported for the specified output mode or sampling method (%s). Setting number of threads to 1.",  _numThreads, SampleMethodStr());
+            _numThreads = 1;
+        }
+
+        struct timespec start, end;
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        unsigned long samplesCounter = 0;
+        int batchCounter = 0;
+        Boolean confMet = false;
+
+        while (!confMet && !_earlyAbort) {
+            if (_stopMode == stopOnSamples) {
+                // one and done, distribute the n samples amongst the threads and stop there
+                SampleNGraphletsInThreads(_seed, k, G, varraySize, numSamples, _numThreads);
+                samplesCounter += numSamples;
+                break;
+            } else if (_stopMode == stopOnPrecision) {
+		// 300000; //1000*sqrt(_numOrbits); //heuristic: batchSizes smaller than this lead to spurious early stops
+                int batchSize = G->numEdges * 10;
+
+                STAT *sTotal[MAX_CANONICALS];
+		if(_desiredPrec && _quiet<2)
+		    Note("using batchSize %d to estimate counts with relative precision %g (%g digit%s) with %g%% confidence",
+			batchSize, _desiredPrec, _desiredDigits, (fabs(1-_desiredDigits)<1e-6?"":"s"), 100*_confidence);
+                for(i=0; i<_numCanon; i++) if(SetIn(_connectedCanonicals,i)) sTotal[i] = StatAlloc(0,0,0, false, false);
+
+                SampleNGraphletsInThreads(_seed, k, G, varraySize, batchSize, _numThreads);
+
+                samplesCounter += batchSize; // Correctly increment samples counter only once.
+                batchCounter++;
+
+                int minNumBatches = 13-k+1/sqrt(1-_confidence)/k; //heuristic
+                int maxNumBatches = 1000*minNumBatches; // huge
+                double worstInterval=0, intervalSum=0;
+                _worstCanon = -1;
+
+                if(_batchRawTotalSamples) { // in rare cases a batch may finish with no actual samples
+                    // Even though the samples may not be Normally distributed, the Law of Large Numbers
+                    // guarantees that for sufficiently large batches, the batch means *are* Normally
+                    // distributed, so we can compute confidence intervals.
+                    for(int l=0;l<_numCanon;l++) if(SetIn(_connectedCanonicals,l) && _batchRawCount[l]) {
+                        double sample = _batchRawCount[l];
+                        if(_precisionWt == PrecWtNone) 
+                            StatAddSample(sTotal[l], sample);
+                        else {
+                            double w = sample;
+                            if(_precisionWt == PrecWtLog) {if(w>1) w = log(w);}
+                            else assert(_precisionWt == PrecWtRaw);
+                            StatAddWeightedSample(sTotal[l], w, sample);
+                        }
+                        if(StatN(sTotal[l]) > 1) {
+                            double relInterval = StatConfInterval(sTotal[l], _confidence) / StatMean(sTotal[l]);
+                            intervalSum += relInterval;
+                            // under-sampled graphlets (<=2) don't count towards "worst"
+                            if( _graphletCount[l] > 2 && relInterval > worstInterval) {
+                                worstInterval = relInterval;
+                                _worstCanon=l;
+                            }
+                        }
+                    }
+                    _meanPrec = intervalSum/_numConnectedCanon;
+                    if(worstInterval) 
+                        _worstPrecision = worstInterval;
+
+                    double currentBatchPrecision=-1;
+                    switch(_precisionMode) {
+                        case mean: currentBatchPrecision = _meanPrec; break;
+                        case worst: currentBatchPrecision = _worstPrecision; break;
+                        default: Fatal("unknown precision mode"); break;
+                    }
+
+                    if(_quiet<1) {
+                        FILE *fp;
+                        fp = popen("date -Iseconds | sed -e 's/T/ /' -e 's/,/./' -e 's/-..:..$//'", "r");
+                        char buf[BUFSIZ];
+                        if(fp && buf == fgets(buf, sizeof(buf)-1, fp)) {
+                            pclose(fp);
+                            buf[strlen(buf)-1] = '\0'; // nuke the newline
+                        }
+                        else strcpy(buf, "(time failed)");
+                        // Note: batchCounter is used here instead of the non-effective batchSize increment
+                        Note("%s batch %d CPU %gs samples %lu prec mean %.3g worst %.3g (g%d count %.0f)",
+			    buf, batchCounter, GetCPUseconds(), samplesCounter, _meanPrec,
+			    worstInterval, _worstCanon, _graphletCount[_worstCanon]);
+                    }
+
+                    if(batchCounter >= maxNumBatches || (batchCounter >= minNumBatches && currentBatchPrecision < _desiredPrec))
+                        confMet=true; // don't reset the counts if we're done
+                    else {
+                        _batchRawTotalSamples = 0;
+                        for(j=0;j<_numCanon;j++) _batchRawCount[j] = 0;
+                    }
+                }
+                else {
+                    if(_quiet<3) Warning("invalid batch %d, batchTotal is zero", batchCounter);
+                }
+            } else {
+                Fatal("RunBlantFromGraph: unknown _stopMode %d", _stopMode);
+            }
+        }
+
+        clock_gettime(CLOCK_MONOTONIC, &end);
+        double elapsed_time = (end.tv_sec - start.tv_sec) +
+                            (end.tv_nsec - start.tv_nsec) / 1e9;
+        if(!_quiet) Note("Took %f seconds to sample %lu with %d threads in %d batches.",
+		elapsed_time, samplesCounter, _numThreads, batchCounter); 
+    }
+#if 0
+    //THIS IS THE OLD PRECISION BASED SAMPLING LOOP, which has been moved into "} else if (_stopMode == stopOnPrecision) {" 
+    //by making some modifications to make it work in multithreading
+    else // all other sampling methods in which non-reentrancy has not been implemented are ran here; eventually this will be gone
     {
-	int batchSize = 300000; //1000*sqrt(_numOrbits); //heuristic: batchSizes smaller than this lead to spurious early stops
+	int batchSize = G->numEdges*10; // 300000; //1000*sqrt(_numOrbits); //heuristic: batchSizes smaller than this lead to spurious early stops
 	if(_desiredPrec && _quiet<2)
 	    Note("using batches of size %d to estimate counts with relative precision %g (%g digit%s) with %g%% confidence",
 		batchSize, _desiredPrec, _desiredDigits, (fabs(1-_desiredDigits)<1e-6?"":"s"), 100*_confidence);
-	unsigned long i;
 	STAT *sTotal[MAX_CANONICALS];
 	for(i=0; i<_numCanon; i++) if(SetIn(_connectedCanonicals,i)) sTotal[i] = StatAlloc(0,0,0, false, false);
 	Boolean confMet = false;
@@ -577,7 +838,7 @@ static int RunBlantFromGraph(int k, unsigned long numSamples, GRAPH *G)
         for(i=0; (i<numSamples || (_sampleFile && !_sampleFileEOF) || (_desiredPrec && !confMet)) && !_earlyAbort; i++)
         {
             if(_window) {
-                SampleGraphlet(G, V, Varray, _windowSize, G->n);
+                SampleGraphlet(G, V, Varray, _windowSize, G->n, &_trashAccumulator);
                 _numWindowRep = 0;
                 if (_windowSampleMethod == WINDOW_SAMPLE_MIN || _windowSampleMethod == WINDOW_SAMPLE_MIN_D ||
 			_windowSampleMethod == WINDOW_SAMPLE_LEAST_FREQ_MIN)
@@ -590,21 +851,20 @@ static int RunBlantFromGraph(int k, unsigned long numSamples, GRAPH *G)
                 if(_numWindowRep > 0)
                     ProcessWindowRep(G, Varray, windowRepInt);
             }
-            else if (_outputMode == graphletDistribution)
+            else if (_outputMode & graphletDistribution)
                 ProcessWindowDistribution(G, V, Varray, k, empty_g, prev_node_set, intersect_node);
             else {
 		static unsigned long stuck;
-                double weight = SampleGraphlet(G, V, Varray, k, G->n);
-                if(ProcessGraphlet(G, V, Varray, k, empty_g, weight)) {
+                double weight = SampleGraphlet(G, V, Varray, k, G->n, &_trashAccumulator);
+                if(ProcessGraphlet(G, V, Varray, k, empty_g, weight, &_trashAccumulator)) {
 		    stuck = 0;
 		    if(_desiredPrec) {
 			if(i && i%batchSize==0) { // we just finished a batch
-			    int minNumBatches = 3+1/sqrt(1-_confidence)/k; //heuristic
+			    int minNumBatches = 13-k+1/sqrt(1-_confidence)/k; //heuristic
 			    int maxNumBatches = 1000*minNumBatches; // huge
 			    double worstInterval=0, intervalSum=0;
 			    _worstCanon = -1;
 			    if(_batchRawTotalSamples) { // in rare cases a batch may finish with no actual samples
-				int j;
 				// Even though the samples may not be Normally distributed, the Law of Large Numbers
 				// guarantees that for sufficiently large batches, the batch means *are* Normally
 				// distributed, so we can compute confidence intervals.
@@ -639,8 +899,12 @@ static int RunBlantFromGraph(int k, unsigned long numSamples, GRAPH *G)
 				if(++batch && _quiet<1) {
 				    FILE *fp;
 				    fp = popen("date -Iseconds | sed -e 's/T/ /' -e 's/,/./' -e 's/-..:..$//'", "r");
-				    char buf[BUFSIZ]; fgets(buf, sizeof(buf)-1, fp); pclose(fp);
-				    buf[strlen(buf)-1] = '\0'; // nuke the newline
+				    char buf[BUFSIZ];
+				    if(fp && buf == fgets(buf, sizeof(buf)-1, fp)) {
+					pclose(fp);
+					buf[strlen(buf)-1] = '\0'; // nuke the newline
+				    }
+				    else strcpy(buf, "(time failed)");
 				    Note("%s batch %d CPU %gs samples %ld prec mean %.3g worst %.3g (g%d count %.0f)",buf,batch,
 					GetCPUseconds(), i, _meanPrec, worstInterval, _worstCanon, _graphletCount[_worstCanon]);
 				}
@@ -666,7 +930,7 @@ static int RunBlantFromGraph(int k, unsigned long numSamples, GRAPH *G)
 		}
             }
         }
-	assert(i);
+	// assert(i);
 	if(i<numSamples) {
 	    if(_quiet<2) Warning("only took %d samples out of %d", i, numSamples);
 	}
@@ -683,73 +947,81 @@ static int RunBlantFromGraph(int k, unsigned long numSamples, GRAPH *G)
 	}
 	for(i=0; i<_numCanon; i++) if(SetIn(_connectedCanonicals,i)) StatFree(sTotal[i]);
     }
+#endif
 
     // Sampling done. Now generate output for output modes that require it.
 
-    int i,j;
     if(_window) {
         for(i=0; i<_numWindowRepArrSize; i++) Free(_windowReps[i]);
         Free(_windowReps);
         if(_windowRep_limit_method) HeapFree(_windowRep_limit_heap);
     }
-    if ((_sampleMethod==SAMPLE_MCMC || _sampleMethod==SAMPLE_NODE_EXPANSION || _sampleMethod==SAMPLE_SEQUENTIAL_CHAINING || _sampleMethod == SAMPLE_EDGE_EXPANSION) &&
-	    !_window)
+    if ((_sampleMethod==SAMPLE_MCMC || _sampleMethod==SAMPLE_NODE_EXPANSION || SAMPLE_EDGE_EXPANSION) && !_window)
 	finalize(G, numSamples);
 
-    if ((_outputMode == graphletFrequency || _outputMode == outputGDV || _outputMode == outputODV) && !_window)
+    if ((_outputMode & graphletFrequency || _outputMode & outputGDV || _outputMode & outputODV) && !_window)
 	convertFrequencies(numSamples);
 
-    if(((_outputMode == graphletFrequency && _freqDisplayMode == freq_display_mode_estimate_absolute) ||
-	_outputMode == outputGDV || _outputMode == outputODV) && !_window)
+    if(((_outputMode & graphletFrequency && _freqDisplayMode == freq_display_mode_estimate_absolute) ||
+	_outputMode & outputGDV || _outputMode & outputODV) && !_window)
 	computeAbsoluteMultiplier(numSamples);
 
-    switch(_outputMode)
-    {
-	int canon, orbit_index, u,v,c;
-    case indexGraphlets: case indexGraphletsRNO: case indexOrbits: case indexMotifs: case indexMotifOrbits:
-	break; // already printed on-the-fly in the Sample/Process loop above
-    case graphletFrequency:
+    int canon, orbit_index, u,v,c;
+    // case indexGraphlets: case indexGraphletsRNO: case indexOrbits: case indexMotifs: case indexMotifOrbits:
+	//break; // already printed on-the-fly in the Sample/Process loop above
+    if(_outputMode & graphletFrequency) {
+	char buf[BUFSIZ];
 	for(canon=0; canon<_numCanon; canon++) {
 	    if (SetIn(_connectedCanonicals, canon)) {
 		if(_freqDisplayMode == freq_display_mode_concentration)
-		    printf("%lf %s\n", _graphletConcentration[canon], PrintOrdinal(canon));
+		    printf("%lf %s\n", _graphletConcentration[canon], PrintOrdinal(buf, canon));
 		else
 		    printf("%llu %s\n", (unsigned long long) llround(_absoluteCountMultiplier * _graphletCount[canon]),
-			PrintOrdinal(canon));
+			PrintOrdinal(buf, canon));
 	    }
 	}
-	break;
-    case predict_merge:
-	assert(false); break; // shouldn't get here
-    case predict:
-	Predict_FlushMotifs(G);
-	break;
-    case outputGDV:
+    }
+    if(_outputMode & predict_merge) assert(false); // shouldn't get here
+    if(_outputMode & predict) {
+	Predict_Flush(G);
+	// Turn off ODV and GDV output because we needed them to be COMPUTED but don't want them output in predictMode
+	_outputMode &= ~(outputGDV|outputODV);
+    }
+    // Note: the test for predict mode output MUST be above the test for ODV/GDV output, to turn them off if we're predicting
+    const int printBuf = _numCanon*16; // %.15g below, plus a space
+    if(_outputMode & outputGDV) {
 	for(i=0; i < G->n; i++)
 	{
-	    printf("%s", PrintNode(0,i));
+	    char buf[printBuf];
+	    PrintNode(buf, 0,i);
 	    for(canon=0; canon < _numCanon; canon++)
 		if (_MCMC_EVERY_EDGE || (_sampleMethod != SAMPLE_MCMC && _sampleMethod != SAMPLE_NODE_EXPANSION && 
-			_sampleMethod != SAMPLE_SEQUENTIAL_CHAINING && _sampleMethod != SAMPLE_EDGE_EXPANSION)) printf(" %.15g", GDV(i,canon));
-		else printf(" %llu", (unsigned long long) llround(_absoluteCountMultiplier * _doubleGraphletDegreeVector[canon][i]));
-	    puts("");
+			_sampleMethod != SAMPLE_EDGE_EXPANSION)) 
+            sprintf(buf+strlen(buf), " %.15g", GDV(i,canon));
+		else sprintf(buf+strlen(buf), " %llu", (unsigned long long) llround(_absoluteCountMultiplier * _graphletDegreeVector[canon][i]));
+	    if(strlen(buf) >= printBuf)
+		Fatal("strlen(buf) is %d, compared to printBuf size %d", strlen(buf), printBuf);
+	    puts(buf);
 	}
-	break;
-    case outputODV:
+    }
+    if(_outputMode & outputODV) {
+	char buf[printBuf];
         for(i=0; i<G->n; i++) {
-	    printf("%s", PrintNode(0,i));
+	    PrintNode(buf,0,i);
 	    for(j=0; j<_numConnectedOrbits; j++) {
 		if (k == 4 || k == 5) orbit_index = _connectedOrbits[_orca_orbit_mapping[j]];
 		else orbit_index = _connectedOrbits[j];
 		if(_MCMC_EVERY_EDGE || (_sampleMethod != SAMPLE_MCMC && _sampleMethod != SAMPLE_NODE_EXPANSION && 
-		    _sampleMethod != SAMPLE_SEQUENTIAL_CHAINING && _sampleMethod != SAMPLE_EDGE_EXPANSION))
-			printf(" %.15g", ODV(i,orbit_index));
-		else printf(" %llu", (unsigned long long) llround(_absoluteCountMultiplier * _doubleOrbitDegreeVector[orbit_index][i]));
+		    _sampleMethod != SAMPLE_EDGE_EXPANSION))
+			sprintf(buf+strlen(buf), " %.15g", ODV(i,orbit_index));
+		else sprintf(buf+strlen(buf), " %llu", (unsigned long long) llround(_absoluteCountMultiplier * _orbitDegreeVector[orbit_index][i]));
 	    }
-	    printf("\n");
+	    if(strlen(buf) >= printBuf)
+		Fatal("strlen(buf) is %d, compared to printBuf size %d", strlen(buf), printBuf);
+	    puts(buf);
 	}
-        break;
-    case communityDetection:
+    }
+    if(_outputMode & communityDetection) {
 	assert(_communityMode == 'o' || _communityMode == 'g');
 	switch(_communityMode)
 	{
@@ -757,19 +1029,22 @@ static int RunBlantFromGraph(int k, unsigned long numSamples, GRAPH *G)
 	    for(u=0; u<G->n; u++) {
 		for(c=0; c<_numConnectedOrbits; c++) {
 		    orbit_index = _connectedOrbits[c];
-		    double odv=ODV(u,orbit_index);
+		    double odv=_orbitDegreeVector[orbit_index][u];
 		    int numPrinted = 0;
+		    char buf[BUFSIZ];
 		    if(odv && _communityNeighbors[u] && _communityNeighbors[u][orbit_index] && SetCardinality(_communityNeighbors[u][orbit_index])) {
-			int buf=0;
+			int neigh=0;
 			for(j=0;j<GraphDegree(G,u); j++) {
-			    v = GraphNextNeighbor(G,u,&buf); assert(v!=-1); // G->neighbor[u][j];
+			    char jbuf[BUFSIZ];
+			    v = GraphNextNeighbor(G,u,&neigh); assert(v!=-1); // G->neighbor[u][j];
 			    if(SetIn(_communityNeighbors[u][orbit_index],v)) {
-				if(!numPrinted++) printf("%s %d %.15g\t", PrintNode(0,u), orbit_index, odv);
-				printf("%s", PrintNode(' ',v));
+				if(!numPrinted++) sprintf(buf, "%s %d %.15g\t", PrintNode(jbuf, 0,u), orbit_index, odv);
+				PrintNode(buf+strlen(buf), ' ',v);
 			    }
 			}
-			assert(-1==GraphNextNeighbor(G,u,&buf));
-			if(numPrinted) printf("\n");
+			assert(-1==GraphNextNeighbor(G,u,&neigh));
+			assert(strlen(buf) < BUFSIZ);
+			if(numPrinted) puts(buf);
 		    }
 		}
 	    }
@@ -777,43 +1052,44 @@ static int RunBlantFromGraph(int k, unsigned long numSamples, GRAPH *G)
 	case 'g':
 	    for(u=0; u<G->n; u++) {
 		for(c=0; c<_numCanon; c++) if(SetIn(_connectedCanonicals,c)) {
-		    double gdv=GDV(u,c);
+		    double gdv=_graphletDegreeVector[c][u];
 		    int numPrinted = 0;
+		    char buf[BUFSIZ];
 		    if(gdv && _communityNeighbors[u] && _communityNeighbors[u][c] && SetCardinality(_communityNeighbors[u][c])) {
-			int buf=0;
+			int neigh=0;
 			for(j=0;j<GraphDegree(G,u); j++) {
-			    v = GraphNextNeighbor(G,u,&buf); assert(v!=-1); //G->neighbor[u][j];
+			    char jbuf[BUFSIZ];
+			    v = GraphNextNeighbor(G,u,&neigh); assert(v!=-1); //G->neighbor[u][j];
 			    if(SetIn(_communityNeighbors[u][c],v)) {
-				if(!numPrinted++) printf("%s %d %lg\t", PrintNode(0,u), c, gdv);
-				printf("%s", PrintNode(' ',v));
+				if(!numPrinted++) sprintf(buf, "%s %d %lg\t", PrintNode(jbuf, 0,u), c, gdv);
+				PrintNode(buf+strlen(buf), ' ',v);
 			    }
 			}
-			assert(-1==GraphNextNeighbor(G,u,&buf));
-			if(numPrinted) printf("\n");
+			assert(-1==GraphNextNeighbor(G,u,&neigh));
+			assert(strlen(buf) < BUFSIZ);
+			if(numPrinted) puts(buf);
 		    }
 		}
 	    }
 	    break;
 	default: Fatal("unknown _communityMode %c", _communityMode);
 	}
-	break;
-    case graphletDistribution:
+    }
+    if(_outputMode & graphletDistribution) {
         for(i=0; i<_numCanon; i++) {
             for(j=0; j<_numCanon; j++)
                 printf("%d ", _graphletDistributionTable[i][j]);
             printf("\n");
         }
-        break;
-    default: Abort("RunBlantFromGraph: unknown or un-implemented outputMode");
-	break;
-	}
+    }
+    if(!_outputMode) Abort("RunBlantFromGraph: unknown or un-implemented outputMode");
 
 #if !O_ALLOC && PARANOID_ASSERTS
     // no point in freeing this stuff since we're about to exit; it can take significant time for large graphs.
-    if(_outputMode == outputGDV) for(i=0;i<_numCanon;i++) Free(_graphletDegreeVector[i]);
-    if(_outputMode == outputODV || (_outputMode == communityDetection && _communityMode=='o'))
+    if(_outputMode & outputGDV) for(i=0;i<_numCanon;i++) Free(_graphletDegreeVector[i]);
+    if(_outputMode & outputODV || (_outputMode & communityDetection && _communityMode=='o'))
 	for(i=0;i<_numOrbits;i++) Free(_orbitDegreeVector[i]);
-    if(_outputMode == outputODV && _MCMC_EVERY_EDGE) for(i=0;i<_numOrbits;i++) Free(_doubleOrbitDegreeVector[i]);
+    if(_outputMode & outputODV && _MCMC_EVERY_EDGE) for(i=0;i<_numOrbits;i++) Free(_orbitDegreeVector[i]);
 #endif
     if (_sampleMethod == SAMPLE_ACCEPT_REJECT && numSamples)
     	fprintf(stderr,"Average number of tries per sample is %.15g\n", _acceptRejectTotalTries/(double)numSamples);
@@ -851,7 +1127,8 @@ FILE *ForkBlant(int k, unsigned long numSamples, GRAPH *G)
 	(void)close(fds[1]); // close the original write end of the pipe since it's been moved to fd 1.
 
 	// For any "counting" mode, use internal numbering when communicating through pipes to the parent
-	if(_outputMode != indexGraphlets && _outputMode != indexGraphletsRNO && _outputMode != indexOrbits) _supportNodeNames = false;
+	if(!(_outputMode & indexGraphlets) && !(_outputMode & indexGraphletsRNO) && !(_outputMode & indexOrbits))
+	    _supportNodeNames = false;
 
 	RunBlantFromGraph(k, numSamples, G);
 	exit(0);
@@ -865,115 +1142,114 @@ FILE *ForkBlant(int k, unsigned long numSamples, GRAPH *G)
 }
 
 
-static FILE *fpThreads[MAX_POSSIBLE_THREADS]; // these will be the pipes reading output of the parallel blants
+static FILE *fpProcs[MAX_POSSIBLE_THREADS]; // these will be the pipes reading output of the parallel blants
 
 // This is the primary entry point into BLANT, even if THREADS=1.  We assume you've already
 // read the graph into G, and will do whatever is necessary to run blant with the number of
-// threads specified.  Also does some sanity checking.
-int RunBlantInThreads(int k, unsigned long numSamples, GRAPH *G)
+// child processes specified.  Also does some sanity checking. 
+// [PTHREADS BRANCH IS DEPRECATING THIS]
+int RunBlantInForks(int k, unsigned long numSamples, GRAPH *G)
 {
     int i, j;
     assert(k == _k);
     assert(G->n >= k); // should really ensure at least one connected component has >=k nodes. TODO
-    if(_outputMode == outputGDV || (_outputMode == communityDetection && _communityMode=='g')) {
-		for(i=0;i<_numCanon;i++) _graphletDegreeVector[i] = Ocalloc(G->n, sizeof(**_graphletDegreeVector));
-		for(i=0;i<_numCanon;i++) _doubleGraphletDegreeVector[i] = Ocalloc(G->n, sizeof(**_doubleGraphletDegreeVector));
-	}
-    if(_outputMode == outputODV || (_outputMode == communityDetection && _communityMode=='o')) {
+    if(_outputMode & outputGDV || (_outputMode & communityDetection && _communityMode=='g')) {
+	// for(i=0;i<_numCanon;i++) _graphletDegreeVector[i] = Ocalloc(G->n, sizeof(**_graphletDegreeVector));
+	for(i=0;i<_numCanon;i++) _graphletDegreeVector[i] = Ocalloc(G->n, sizeof(**_graphletDegreeVector));
+    }
+    if(_outputMode & outputODV || (_outputMode & communityDetection && _communityMode=='o')) {
 	for(i=0;i<_numOrbits;i++) {
-	    _orbitDegreeVector[i] = Ocalloc(G->n, sizeof(**_orbitDegreeVector));
-	    for(j=0;j<G->n;j++) _orbitDegreeVector[i][j]=0;
+	    // _orbitDegreeVector[i] = Ocalloc(G->n, sizeof(**_orbitDegreeVector));
+	    // for(j=0;j<G->n;j++) _orbitDegreeVector[i][j]=0;
 	}
     }
-    if (_outputMode == outputODV) for(i=0;i<_numOrbits;i++){
-	_doubleOrbitDegreeVector[i] = Ocalloc(G->n, sizeof(**_doubleOrbitDegreeVector));
-	for(j=0;j<G->n;j++) _doubleOrbitDegreeVector[i][j]=0.0;
+    if (_outputMode & outputODV) for(i=0;i<_numOrbits;i++){
+	_orbitDegreeVector[i] = Ocalloc(G->n, sizeof(**_orbitDegreeVector));
+	for(j=0;j<G->n;j++) _orbitDegreeVector[i][j]=0.0;
     }
-    if(_outputMode == predict) Predict_Init(G);
-    if (_outputMode == graphletDistribution) {
+    if(_outputMode & predict) Predict_Init(G);
+    if (_outputMode & graphletDistribution) {
         _graphletDistributionTable = Ocalloc(_numCanon, sizeof(int*));
         for(i=0; i<_numCanon; i++) _graphletDistributionTable[i] = Ocalloc(_numCanon, sizeof(int));
         for(i=0; i<_numCanon; i++) for(j=0; j<_numCanon; j++) _graphletDistributionTable[i][j] = 0;
     }
 
-    if(_JOBS == 1)
+    if(_numThreads == 1)
 	return RunBlantFromGraph(k, numSamples, G);
 
     if (_sampleMethod == SAMPLE_INDEX || _sampleSubmethod == SAMPLE_MCMC_EC)
         Fatal("The sampling methods INDEX and EDGE_COVER do not yet support multithreading (feel free to add it!)");
 
     // At this point, _JOBS must be greater than 1.
-    assert(_JOBS>1);
+    assert(_numThreads>1 && _numThreads <= _maxThreads);
     unsigned long totalSamples = numSamples;
-    double meanSamplesPerJob = totalSamples/(double)_JOBS;
-    if(!_quiet) Note("Parent %d starting about %d jobs of about %d samples each", getpid(), _JOBS, (int)meanSamplesPerJob);
+    double meanSamplesPerJob = totalSamples/(double)_numThreads;
+    if(!_quiet) Note("Parent %d starting about %d jobs of about %d samples each", getpid(), _numThreads, (int)meanSamplesPerJob);
 
-    int threadsRunning = 0, jobsDone = 0, thread, job=0;
+    int procsRunning = 0, jobsDone = 0, proc, job=0;
     unsigned long lineNum = 0;
-    for(i=0; numSamples > 0 && i<_MAX_THREADS;i++) {
+    for(i=0; numSamples > 0 && i<_maxThreads;i++) {
 	unsigned long samples = meanSamplesPerJob;
 	assert(samples>0);
 	if(samples > numSamples) samples = numSamples;
 	numSamples -= samples;
-	fpThreads[i] = ForkBlant(_k, samples, G);
-	if(!_quiet) Note("Started job %d of %d samples; %d threads running, %ld samples remaining to take",
-	    job++, samples, ++threadsRunning, numSamples);
+	fpProcs[i] = ForkBlant(_k, samples, G);
+	if(!_quiet) Note("Started job %d of %d samples; %d children running, %ld samples remaining to take",
+	    job++, samples, ++procsRunning, numSamples);
     }
 
-    do // this loop reads lines from the parallel child threads, one line read per thread per loop iteration
+    do // this loop reads lines from the parallel child procs, one line read per proc per loop iteration
     {
-	char line[1000*1000*1000]; // this is just supposed to be really large
-	for(thread=0;thread<_MAX_THREADS;thread++)	// process one line from each thread
+	char line[1000 * BUFSIZ]; // this is just supposed to be really large
+	for(proc=0;proc<_maxThreads;proc++)	// process one line from each proc
 	{
-	    if(!fpThreads[thread]) continue;
-	    char *tmp = fgets(line, sizeof(line), fpThreads[thread]);
+	    if(!fpProcs[proc]) continue;
+	    char *tmp = fgets(line, sizeof(line), fpProcs[proc]);
 	    assert(tmp>=0);
-	    if(feof(fpThreads[thread]))
+	    if(feof(fpProcs[proc]))
 	    {
 		wait(NULL); // reap the child
-		clearerr(fpThreads[thread]);
-		fclose(fpThreads[thread]);
-		fpThreads[thread] = NULL;
-		++jobsDone; --threadsRunning;
-		if(!_quiet) Note("Thead %d finished; jobsDone %d, threadsRunning %d", thread, jobsDone, threadsRunning);
-		if(numSamples == 0) fpThreads[thread] = NULL; // signify this pointer is finished.
+		clearerr(fpProcs[proc]);
+		fclose(fpProcs[proc]);
+		fpProcs[proc] = NULL;
+		++jobsDone; --procsRunning;
+		if(!_quiet) Note("Thead %d finished; jobsDone %d, procsRunning %d", proc, jobsDone, procsRunning);
+		if(numSamples == 0) fpProcs[proc] = NULL; // signify this pointer is finished.
 		else {
 		    unsigned long samples = meanSamplesPerJob;
 		    if(samples > numSamples) samples = numSamples;
 		    numSamples -= samples;
-		    fpThreads[thread] = ForkBlant(_k, samples, G);
-		    assert(fpThreads[thread]);
-		    ++threadsRunning;
+		    fpProcs[proc] = ForkBlant(_k, samples, G);
+		    assert(fpProcs[proc]);
+		    ++procsRunning;
 		    if(!_quiet)
-			Note("Started job %d (thread %d) of %d samples, %d threads running, %ld samples remaining to take",
-			    job++, thread, samples, threadsRunning, numSamples);
+			Note("Started job %d (proc %d) of %d samples, %d procs running, %ld samples remaining to take",
+			    job++, proc, samples, procsRunning, numSamples);
 		}
 		continue; // we'll ask for output next time around.
 	    }
 	    char *nextChar = line, *pch;
 	    double gcount = 0.0;
-	    // EDWARD: printf("Line %d from thread %d is \"%s\"\n", lineNum, thread, tmp);
+	    // EDWARD: printf("Line %d from proc %d is \"%s\"\n", lineNum, proc, tmp);
 	    int canon=-1, orbit=-1, numRead, nodeId;
 	    //fprintf(stderr, "Parent received the following line from the child: <%s>\n", line);
-	    switch(_outputMode)
-	    {
-	    case graphletFrequency:
+	    if(_outputMode & graphletFrequency) {
 		numRead = scanf(line, "%lf%d", &gcount, &canon);
 		assert(numRead == 2);
 		_graphletCount[canon] += gcount;
-		break;
-	    case graphletDistribution:
+	    }
+	    if(_outputMode & graphletDistribution) {
 		for(i=0; i<_numCanon; i++) {
 		    pch = strtok(line, " ");
 		    for(j=0; j<_numCanon; j++){
 			_graphletDistributionTable[i][j] += atoi(pch);
 			pch = strtok(NULL, " ");
 		    }
-		    char *OK = fgets(line, sizeof(line), fpThreads[thread]);
+		    char *OK = fgets(line, sizeof(line), fpProcs[proc]);
 		    assert(OK || (i==_numCanon-1 && j == _numCanon));
 		}
-		break;
-	    case outputGDV:
+	    }
+	    if(_outputMode & outputGDV) {
 		assert(isdigit(*nextChar));
 		numRead = sscanf(nextChar, "%d", &nodeId);
 		assert(numRead == 1 && nodeId == lineNum);
@@ -991,8 +1267,8 @@ int RunBlantInThreads(int k, unsigned long numSamples, GRAPH *G)
 		    nextChar++;
 		}
 		assert(*nextChar == '\0');
-		break;
-	    case outputODV:
+	    }
+	    if(_outputMode & outputODV) {
 		assert(isdigit(*nextChar));
 		numRead = sscanf(nextChar, "%d", &nodeId);
 		assert(numRead == 1 && nodeId == lineNum);
@@ -1010,29 +1286,27 @@ int RunBlantInThreads(int k, unsigned long numSamples, GRAPH *G)
 		    nextChar++;
 		}
 		assert(*nextChar == '\0');
-		break;
-	    case indexGraphlets: case indexGraphletsRNO: case indexOrbits: case indexMotifs: case indexMotifOrbits:
+	    }
+	    if(_outputMode&indexGraphlets || _outputMode&indexGraphletsRNO || _outputMode&indexOrbits || _outputMode&indexMotifs || _outputMode&indexMotifOrbits) {
 		fputs(line, stdout);
 		if(_window)
-		    while(fgets(line, sizeof(line), fpThreads[thread]))
+		    while(fgets(line, sizeof(line), fpProcs[proc]))
 			fputs(line, stdout);
-		break;
-	    case predict_merge: assert(false); break; // should not be here
-	    case predict:
-		Predict_ProcessLine(G, lineNum, line);
-		break;
-	    default:
-		Abort("oops... unknown or unsupported _outputMode in RunBlantInThreads while reading child process");
-		break;
 	    }
+	    if(_outputMode&predict_merge) assert(false); // should not be here
+	    if(_outputMode& predict) Predict_ProcessLine(G, lineNum, line);
+	    if(!_outputMode)
+		Abort("oops... unknown or unsupported _outputMode in RunBlantInForks while reading child process");
 	}
 	lineNum++;
-	if(threadsRunning > 0) Fatal("Need a way to pass StarMotifCounts from children");
-    } while(threadsRunning > 0);
+	if(procsRunning > 0) Fatal("Need a way to pass StarMotifCounts from children");
+    } while(procsRunning > 0);
 
     // if numSamples is not a multiple of _THREADS, finish the leftover samples
-    unsigned long leftovers = numSamples % _JOBS;
-    return RunBlantFromGraph(_k, leftovers, G);
+    unsigned long leftovers = numSamples % _numThreads;
+    int result = RunBlantFromGraph(_k, leftovers, G);
+    if(_outputMode & predict) Predict_Shutdown(G);
+    return result;
 }
 
 void BlantAddEdge(int v1, int v2, double weight)
@@ -1069,7 +1343,7 @@ int RunBlantEdgesFinished(int k, unsigned long numSamples, int numNodes, char **
     GRAPH *G = GraphFromEdgeList(_numNodes, _numEdges, _pairs, SPARSE, _weights);
     Free(_pairs);
     _nodeNames = nodeNames;
-    return RunBlantInThreads(k, numSamples, G);
+    return RunBlantInForks(k, numSamples, G);
 }
 
 // Initialize the graph G from an edgelist; the user must allocate the pairs array
@@ -1081,14 +1355,14 @@ int RunBlantFromEdgeList(int k, unsigned long numSamples, int numNodes, int numE
     assert(numNodes >= k);
     GRAPH *G = GraphFromEdgeList(numNodes, numEdges, pairs, SPARSE, weights);
     Free(pairs);
-    return RunBlantInThreads(k, numSamples, G);
+    return RunBlantInForks(k, numSamples, G);
 }
 
 const char * const USAGE_SHORT =
 "BLANT (Basic Local Alignment of Network Topology): sample graphlets of up to 8 nodes from a graph.\n"\
 "USAGE: blant [OPTIONS] -k graphletNodes graphInputFile\n"\
 " Common options: (use -h for longer help)\n"\
-"    -s samplingMethod (default MCMC; SEC, NBE, EBE!, RES!, AR!, FAYE!, INDEX, EDGE_COVER)\n"\
+"    -s samplingMethod (default MCMC; NBE, EBE!, RES!, AR!, FAYE!, INDEX, EDGE_COVER)\n"\
 "       Note: exclamation mark required after some method names to supress warnings about them.\n"\
 "    -m{outputMode} (default f=frequency; o=ODV, g=GDV, i=index, cX=community(X=g,o), r=root, d=neighbor distribution\n"\
 "    -d{displayModeForCanonicalIDs} (default i=integerOrdinal, o=ORCA, j=Jesse, b=binary, d=decimal, n=noncanonical)\n"\
@@ -1125,8 +1399,6 @@ const char * const USAGE_LONG =
 "         nodes to S using an MCMC graph walking algorithm with restarts; gives asymptotically correct relative frequencies\n"\
 "         when using purely counting modes like -m{o|g|f}, but biased counts in indexing modes like -m{i|j} since we remove\n"\
 "         duplicates in indexing modes.)\n"\
-"	SEC (Sequential Edge Chaining): like MCMC but instead of a walk, reset the walk for every sampled graphlet.\n"\
-"         Note: SEC is the default when using precision (-[Pp] on the command line), otherwise MCMC is the default.\n"\
 "	NBE (Node-Based Expansion): pick an edge at random and add it to the node set S; add new nodes by choosing\n"\
 "         uniformly at random from all nodes one step outside S. (slow, but correct)\n"\
 "	EBE (Edge-Based Expansion): pick an edge at random and add its two nodes to S; add nodes to S by picking an edge\n"\
@@ -1216,8 +1488,8 @@ int main(int argc, char *argv[])
 
     signal(SIGUSR1, SigEarlyAbort);
 
-    _JOBS = 1;
-    _MAX_THREADS = 4;
+    _numThreads = 1;
+    _maxThreads = sysconf(_SC_NPROCESSORS_ONLN);
 
     _k = 0; _k_small = 0;
 
@@ -1226,11 +1498,11 @@ int main(int argc, char *argv[])
     // When adding new options, please insert them in ALPHABETICAL ORDER. Note that options that require arguments
     // (eg "-k3", where 3 is the argument) require a colon appended; binary options (currently only A, C and h)
     // have no colon appended.
-    while((opt = getopt(argc, argv, "a:d:c:e:f:F:g:hi:k:K:l:M:m:n:o:P:p:qr:Rs:t:T:wW:x:X:")) != -1)
+    while((opt = getopt(argc, argv, "a:d:c:e:f:F:g:hi:k:K:l:M:m:n:o:P:p:qr:Rs:t:T:wW:x:X")) != -1)
     {
 	switch(opt)
 	{
-	long nSampArg;
+	unsigned long nSampArg;
 	case 'q': do ++_quiet; while(optarg && *optarg++);
 	    break;
 	case 'h':
@@ -1260,24 +1532,25 @@ int main(int argc, char *argv[])
 	    if(_outputMode != undef) Fatal("tried to define output mode twice");
 	    switch(*optarg)
 	    {
-	    case 'c': _outputMode = communityDetection;
+	    // SYNTH case 's': _outputMode |= synthetic;
+	    case 'c': _outputMode |= communityDetection;
 		switch(*(optarg+1)) {
 		case 'o': _communityMode='o'; break;
 		case '\0': case 'g': _communityMode='g'; break;
 		default: Fatal("-mc%c: unknown community mode; valid values g or o\n", *(optarg+1)); break;
 		}
 		break;
-	    case 'm': _outputMode = indexMotifs; break;
-	    case 'M': _outputMode = indexMotifOrbits; break;
-	    case 'i': _outputMode = indexGraphlets; break;
-	    case 'r': _outputMode = indexGraphletsRNO; break;
-	    case 'j': _outputMode = indexOrbits; break;
-	    case 'f': _outputMode = graphletFrequency; break;
-	    case 'g': _outputMode = outputGDV; break;
-	    case 'o': _outputMode = outputODV; break;
-	    case 'd': _outputMode = graphletDistribution; break;
-	    case 'p': _outputMode = predict; break;
-	    case 'q': _outputMode = predict_merge; break;
+	    case 'm': _outputMode |= indexMotifs; break;
+	    case 'M': _outputMode |= indexMotifOrbits; break;
+	    case 'i': _outputMode |= indexGraphlets; break;
+	    case 'r': _outputMode |= indexGraphletsRNO; break;
+	    case 'j': _outputMode |= indexOrbits; break;
+	    case 'f': _outputMode |= graphletFrequency; break;
+	    case 'g': _outputMode |= outputGDV; break;
+	    case 'o': _outputMode |= outputODV; break;
+	    case 'd': _outputMode |= graphletDistribution; break;
+	    case 'p': _outputMode |= (predict|outputGDV|outputODV); break;
+	    case 'q': _outputMode |= predict_merge; break;
 	    default: Fatal("-m%c: unknown output mode \"%c\"", *optarg,*optarg);
 	    break;
 	    }
@@ -1297,9 +1570,9 @@ int main(int argc, char *argv[])
 	    break;
 	    }
 	    break;
-	case 't': if(1!=sscanf(optarg, "%d", &_JOBS)) Fatal("main: sscanf failed to read _JOBS");
-	    _MAX_THREADS = _JOBS;
-	    assert(1 <= _JOBS && _MAX_THREADS <= MAX_POSSIBLE_THREADS);
+	case 't': 
+        _numThreads = atoi(optarg);
+        if(_numThreads > _maxThreads) Fatal("More threads specified than available on system.");
 	    break;
 	case 'r': _seed = atoi(optarg); if(_seed==-1)Apology("seed -1 ('-r -1' is reserved to mean 'uninitialized'");
 	    break;
@@ -1309,8 +1582,8 @@ int main(int argc, char *argv[])
 	    if (_sampleMethod != -1) Fatal("Tried to define sampling method twice");
 	    else if (strncmp(optarg, "NBE", 3) == 0)
 		_sampleMethod = SAMPLE_NODE_EXPANSION;
-	    else if (strncmp(optarg, "SEC", 3) == 0)
-		_sampleMethod = SAMPLE_SEQUENTIAL_CHAINING;
+	    else if (strncmp(optarg, "SEC", 3) == 0) //_sampleMethod = SAMPLE_SEQUENTIAL_CHAINING;
+		Apology("SEC is no longer supported due to fundamentally unfixable problems with the method");
 	    else if (strncmp(optarg, "FAYE", 4) == 0) {
 		if (strncmp(optarg, "FAYE!",5) != 0) Warning("FAYE is an ancient variant of NBE and produces counts with potentially large biases; suppress this warning by appending an exclamation mark");
 		_sampleMethod = SAMPLE_FAYE;
@@ -1345,7 +1618,7 @@ int main(int argc, char *argv[])
 		if(strcmp(optarg,"STDIN") == 0) _sampleFile = stdin;
 		else _sampleFile = fopen(_sampleFileName, "r");
 		if(!_sampleFile)
-		    Fatal("Unrecognized sampling method '%s'; recognized options are NBE, MCMC, SEC, EBE, RES, FAYE, AR, or a filename (that can be 'STDIN'), but file '%s' cannot be opened", optarg, _sampleFileName);
+		    Fatal("Unrecognized sampling method '%s'; recognized options are NBE, MCMC, EBE, RES, FAYE, AR, or a filename (that can be 'STDIN'), but file '%s' cannot be opened", optarg, _sampleFileName);
 		_sampleMethod = SAMPLE_FROM_FILE;
 	    }
 	    break;
@@ -1373,6 +1646,7 @@ int main(int argc, char *argv[])
 		default: Fatal("unknown precision weighting %c", wChar);
 		}
 	    }
+	    _stopMode = stopOnPrecision;
 	    break;
 	case 'c': _confidence = atof(optarg);
 	    if(_confidence <= 0) Fatal("confidence must be in (0,1), not %g", _confidence);
@@ -1434,8 +1708,9 @@ int main(int argc, char *argv[])
 	    if (!_numWindowRepLimit) {_numWindowRepLimit = 10; _numWindowRepArrSize = _numWindowRepLimit;}
 	    _windowRep_limit_heap = HeapAlloc(_numWindowRepLimit, asccompFunc, NULL);
 	    break;
-	case 'n': nSampArg = atol(optarg);
+	case 'n': sscanf(optarg, "%lu", &nSampArg);
 	    if(nSampArg < 0) Fatal("%s\nFatal Error: numSamples [%s] must be a non-negative integer", USAGE_SHORT, optarg);
+	    //Note("got numSamples %ld from string \"%s\"", nSampArg, optarg);
 	    numSamples = nSampArg;
 	    char lastChar = optarg[strlen(optarg)-1];
 	    if(!isdigit(lastChar))
@@ -1444,6 +1719,8 @@ int main(int argc, char *argv[])
 		case 'm': case 'M': numSamples *= 1024; // do NOT break, fall through
 		case 'k': case 'K': numSamples *= 1024; break;
 		default: Fatal("%s\nERROR: numSamples can be appended by k, m, b, or g but not %c\n%s", USAGE_SHORT, lastChar);
+        _stopMode = stopOnSamples;
+        _numSamples = numSamples;
 		break;
 	    }
 	    //fprintf(stderr, "numSamples set to %d\n", numSamples);
@@ -1482,6 +1759,7 @@ int main(int argc, char *argv[])
 	}
     }
 
+
     if (_orbitNumber != -1) {
         if (_odvFile != NULL) {
             parseOdvFromFile(_odvFile);
@@ -1492,14 +1770,8 @@ int main(int argc, char *argv[])
 
     if (_sampleMethod == SAMPLE_INDEX && _k <= 5) Fatal("k is %d but must be at least 6 for INDEX sampling method because there are no unambiguous graphlets for k<=5",_k);
 
-    if(_seed == -1) _seed = GetFancySeed(false);
-    // This only seeds the main thread; sub-threads, if they exist, are seeded later by "stealing"
-    // exactly _THREADS-1 values from near the beginning of this main random stream.
-    RandomSeed(_seed);
-
     if(_outputMode == undef) _outputMode = graphletFrequency; // default to frequency, which is simplest
-    if(_freqDisplayMode == freq_display_mode_undef)
-	_freqDisplayMode = freq_display_mode_estimate_absolute; // Default to estimating count
+    if(_freqDisplayMode == freq_display_mode_undef) _freqDisplayMode = freq_display_mode_estimate_absolute; // Default to estimating count
 
     if(numSamples && _desiredPrec) Fatal("cannot specify both -n (sample size) and -[Pp] (desired precision)");
     if(!numSamples && !_desiredPrec) { // default to 2 digits of precision at 99.9% confidence
@@ -1507,34 +1779,16 @@ int main(int argc, char *argv[])
 	_desiredPrec = pow(10, -_desiredDigits);
     }
     if (_sampleMethod == -1) {
-	if(_desiredPrec)
-	    _sampleMethod = SAMPLE_SEQUENTIAL_CHAINING; // MCMC samples are not independent, so use SEC for CI's
-	else
-	    _sampleMethod = SAMPLE_MCMC;
+	_sampleMethod = SAMPLE_EDGE_EXPANSION;
     }
-    if(!_quiet && _outputMode != predict_merge) Note("Sampling method is %s", SampleMethodStr());
+    if(!_quiet && !(_outputMode & predict_merge)) Note("Sampling method is %s", SampleMethodStr());
 
     if(_desiredPrec && _confidence == 0)
 	_confidence = (1-_desiredPrec/10);
     if(_desiredPrec && _sampleMethod == SAMPLE_MCMC)
-	Warning("you've chosen MCMC sampling with confidence intervals; SEC is recommended since adjacent MCMC samples are not independent");
+	Warning("you've chosen MCMC sampling with confidence intervals; EBE is recommended since adjacent MCMC samples are not independent");
 
-    FILE *fpGraph;
-    int piped = 0;
-    if(!argv[optind])
-    {
-	fpGraph = stdin;
-	if(isatty(0) && !_quiet) Warning("reading graph input file from terminal, press ^D to finish");
-    }
-    else {
-	char *graphFileName = argv[optind];
-	fpGraph = readFile(graphFileName, &piped);
-	if(!fpGraph) Fatal("cannot open graph input file '%s'\n", argv[optind]);
-	optind++;
-    }
-    assert(optind == argc || _GRAPH_GEN || _windowSampleMethod == WINDOW_SAMPLE_DEG_MAX);
-
-    SetBlantDir(); // Needs to be done before reading any files in BLANT directory
+    SetBlantDirs(); // Needs to be done before reading any files in BLANT directory
     SetGlobalCanonMaps(); // needs _k to be set
     LoadMagicTable(); // needs _k to be set
 
@@ -1602,7 +1856,24 @@ int main(int argc, char *argv[])
 	    Fatal("must specify either desired precision using -[Pp] (preferred) or number of samples (less preferred)");
     }
 
-    // Read network using native Graph routine.
+    // Derik: start here
+    FILE *fpGraph;
+    int piped = 0;
+    if(!argv[optind])
+    {
+	fpGraph = stdin;
+	if(isatty(0) && !_quiet) Warning("reading graph input file from terminal, press ^D to finish");
+    }
+    else {
+	char *graphFileName = argv[optind];
+	// readFile doesn't actually READ anything, it only prepares the file for reading by, for example, uncompressing it if it's name ends in ".gz"
+	fpGraph = readFile(graphFileName, &piped);
+	if(!fpGraph) Fatal("cannot open graph input file '%s'\n", argv[optind]);
+	optind++;
+    }
+    assert(optind == argc || _GRAPH_GEN || _windowSampleMethod == WINDOW_SAMPLE_DEG_MAX);
+
+    // Read network using native Graph routine. Derik: this is where you can add other graph reading functions
     GRAPH *G = GraphReadEdgeList(fpGraph, SPARSE, _supportNodeNames, _weighted);
     if(_useComplement) G->useComplement = true;
 
@@ -1612,6 +1883,8 @@ int main(int argc, char *argv[])
 	_nodeNames = G->name;
     }
     if(fpGraph != stdin) closeFile(fpGraph, &piped);
+
+    //Derik: end here
 
     // Always allocate this set; if there are no "nodes of interest" then every node is a possible start done
     _startNodes = Calloc(G->n, sizeof(unsigned));
@@ -1656,7 +1929,7 @@ int main(int argc, char *argv[])
 	}
     }
 
-    if(_outputMode == communityDetection) {
+    if(_outputMode & communityDetection) {
 	if(_communityMode == 'o' || _communityMode=='g') // allocate sets for [node][orbit], but 2nd dimension only when needed
 	    _communityNeighbors = (SET***) Calloc(G->n, sizeof(SET**)); // elements are only allocated when needed
 	else
@@ -1701,10 +1974,10 @@ int main(int argc, char *argv[])
     }
 #endif
 
-    if(_outputMode == predict_merge)
+    if(_outputMode & predict_merge)
 	exitStatus = Predict_Merge(G);
     else
-	exitStatus = RunBlantInThreads(_k, numSamples, G);
+    exitStatus = RunBlantFromGraph(_k, numSamples, G);
     GraphFree(G);
     return exitStatus;
 }

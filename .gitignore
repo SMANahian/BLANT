@@ -24,6 +24,7 @@ libwayne/made
 make-orbit-maps
 makeEHD
 compute-alphas-MCMC
+compute-alphas-MCMC-fast
 compute-alphas-NBE
 compute-alphas-EBE
 
@@ -42,3 +43,4 @@ orca_jesse_blant_table/UpperToLower*
 make-orca-jesse-blant-table
 make-subcanon-maps
 *.dot
+test_stamp

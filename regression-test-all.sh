@@ -19,6 +19,11 @@ case "$1" in
     ;;
 esac
 
+if hostname | egrep Waynes-Air; then
+    echo "Assuming this is Wayne's MacBook Air, needing gcc-14"
+    export GCC_VER=-14
+fi
+
 USAGE="USAGE: $0 [ -make ] [ -x BLANT_EXE ][ list of tests to run, defaults to regression-tests/*/*.sh ]"
 
 
@@ -75,7 +80,9 @@ while [ $# -gt -0 ]; do
 done
 [ -x "$EXE" -o "$MAKE" = true ] || die "Executable '$EXE' must exist or you must specify -make"
 
-CORES=${CORES:=1} # cores =1 for now since I broke threading. :-(
+NUM_THREADS=$(getconf _NPROCESSORS_ONLN)
+MAX_THREADS=4  # we don't want to hog all the threads when unit testing
+CORES=$(( NUM_THREADS > MAX_THREADS ? MAX_THREADS : NUM_THREADS ))
 #CORES=${CORES:=`cpus 2>/dev/null | awk '{c2=int($1/2); if(c2>0)print c2; else print 1}'`}
 [ "$CORES" -gt 0 ] || die "can't figure out how many cores this machine has"
 MAKE_CORES=1 # for BLANT, we don't want or need paralellism during make

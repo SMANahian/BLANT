@@ -9,8 +9,7 @@
 
 #define SORT_INDEX_MODE 0 // Note this destroys the columns-are-identical property, don't use by default.
 
-char *PrintNode(char c, int v) {
-    static char buf[BUFSIZ];
+char *PrintNode(char buf[], char c, int v) {
     char *s=buf;
     if(c) *s++ = c;
     if(_supportNodeNames)
@@ -20,8 +19,7 @@ char *PrintNode(char c, int v) {
     return buf;
 }
 
-char *PrintNodePairSorted(int u, char c, int v) {
-    static char buf[BUFSIZ];
+char *PrintNodePairSorted(char buf[], int u, char c, int v) {
     if(_supportNodeNames) {
 	char *s1=_nodeNames[u], *s2=_nodeNames[v];
 	if(strcmp(s1,s2)<0) { char *tmp=s1;s1=s2;s2=tmp; }
@@ -48,43 +46,42 @@ void VarraySort(unsigned *Varray, int k)
 #endif
 }
 
-static char _printBuf[BUFSIZ];
 
-char *PrintGraphletID(Gint_type Gint)
+char *PrintGraphletID(char buf[], Gint_type Gint)
 {
-    if(_displayMode == noncanonical) sprintf(_printBuf, GINT_FMT, Gint);
-    else PrintOrdinal(L_K(Gint));
-    return _printBuf;
+    if(_displayMode == noncanonical) sprintf(buf, GINT_FMT, Gint);
+    else PrintOrdinal(buf, L_K(Gint));
+    return buf;
 }
 
-char *PrintOrdinal(Gordinal_type GintOrdinal)
+char *PrintOrdinal(char buf[], Gordinal_type GintOrdinal)
 {
     int j, GintNumBits = _k*(_k-1)/2;
     char GintBinary[GintNumBits+1]; // Only used in -db output mode for indexing
     switch (_displayMode) {
     case undefined:
     case ordinal:
-	sprintf(_printBuf, GORDINAL_FMT, GintOrdinal);
+	sprintf(buf, GORDINAL_FMT, GintOrdinal);
 	break;
     case decimal: // Prints the decimal integer form of the canonical
-	sprintf(_printBuf, GINT_FMT, _canonList[GintOrdinal]);
+	sprintf(buf, GINT_FMT, _canonList[GintOrdinal]);
 	break;
     case binary: // Prints the bit representation of the canonical
 	for (j=0;j<GintNumBits;j++)
 	    {GintBinary[GintNumBits-j-1]=((_canonList[GintOrdinal] >> j) & 1 ? '1' : '0');}
 	GintBinary[GintNumBits] = '\0';
-	strcpy(_printBuf, GintBinary);
+	strcpy(buf, GintBinary);
 	break;
     case orca: // Prints the ORCA ID of the canonical. Jesse uses same number.
     case jesse:
 	if(SELF_LOOPS) Apology("sorry, orca and jesse output formats do not support self-loops");
-	sprintf(_printBuf, GORDINAL_FMT, _outputMapping[GintOrdinal]);
+	sprintf(buf, GORDINAL_FMT, _outputMapping[GintOrdinal]);
 	break;
     case noncanonical: break; // handled above
     default: Fatal("Internal error: PrintGraphletID called with unknown _displayMode %d", _displayMode);
 	break;
     }
-    return _printBuf;
+    return buf;
 }
 
 // Below is code to help reduce (mostly eliminite if we're lucky) MCMC's duplicate output, which is copious
@@ -107,8 +104,13 @@ char *PrintOrdinal(Gordinal_type GintOrdinal)
 static GRAPH *_G; // local copy of GRAPH *G
 
 // NOTE WE DO NOT CHECK EDGES. So if you call it with the same node set but as a motif, it'll (incorrectly) return TRUE
+// Also this is NON-RE-ENTRANT.
+// Only does anything if sampling method is MCMC, otherwise returns false. This is because this function is terribly non re-entrant
 Boolean NodeSetSeenRecently(GRAPH *G, unsigned Varray[], int k) {
-    _G=G;
+    if (_sampleMethod != SAMPLE_MCMC && _sampleMethod != SAMPLE_MCMC_EC && _sampleMethod != SAMPLE_INDEX) return false;
+    if(_G) assert(_G == G); // only allowed to set it once
+    else _G=G;
+    //if(_JOBS>1 || _MAX_THREADS>1) Apology("NodeSetSeenRecently is not re-entrant (called with %d jobs and %d max threads)", _JOBS, _MAX_THREADS);
     static unsigned circBuf[MCMC_CIRC_BUF], bufPos;
     static BITVEC *seen;
     static unsigned Vcopy[MAX_K];
@@ -117,7 +119,7 @@ Boolean NodeSetSeenRecently(GRAPH *G, unsigned Varray[], int k) {
     memcpy(Vcopy, Varray, k*sizeof(*Varray));
     VarraySort(Vcopy, k);
 
-    if (_outputMode == indexGraphletsRNO) {
+    if (_outputMode & indexGraphletsRNO) {
         // move the first node in Varray (the root node) to the start of Vcopy, since the RNO indexing mode must consider
 	// node sets different if they were created in a different order (specifically, if the root node was different)
         unsigned base_node = Varray[0];
@@ -151,7 +153,7 @@ Boolean NodeSetSeenRecently(GRAPH *G, unsigned Varray[], int k) {
     return false;
 }
 
-char *PrintIndexEntry(Gint_type Gint, Gordinal_type GintOrdinal, unsigned Varray[], int k, double weight, unsigned char* perm)
+char *PrintIndexEntry(char obuf[], Gint_type Gint, Gordinal_type GintOrdinal, unsigned Varray[], int k, double weight, unsigned char* perm)
 {
     int j;
 #if SORT_INDEX_MODE
@@ -160,9 +162,9 @@ char *PrintIndexEntry(Gint_type Gint, Gordinal_type GintOrdinal, unsigned Varray
 #else
     assert(PERMS_CAN2NON);
 #endif
-    static char buf[2][BUFSIZ]; // build the string using two alterating buffers
-    int which=0; // which should ALWAYS point to the one that HAS the data, and you print the next string into buf[1-which]
-    strcpy(buf[which], PrintGraphletID(Gint));
+    char buf[2][BUFSIZ]; // build the string using two alterating buffers
+    int which=0; // which should ALWAYS point to the one that HAS the data, and we print the next string into buf[1-which]
+    PrintGraphletID(buf[which], Gint);
 #define PRINT_NON_CANONICAL 0
 #if PRINT_NON_CANONICAL
         sprintf(buf[1-which], "%s [%d]", buf[which], Gint);
@@ -173,45 +175,46 @@ char *PrintIndexEntry(Gint_type Gint, Gordinal_type GintOrdinal, unsigned Varray
     // repeating orbits but don't have repeating perms). If all graphlets are unambiguous, doing this is fine (since perm
     // will be a bijection with orbit). However, if you want to extract ambiguous graphlets, you'll have to change the code
     // here (and code in a lot of other places)
-    if (_outputMode == indexGraphletsRNO) {
+    if (_outputMode & indexGraphletsRNO) {
         sprintf(buf[1-which], "%s+o%d", buf[which], perm[0]);
 	which=1-which;
     }
 
     for(j=0;j<k;j++) {
-	sprintf(buf[1-which], "%s%s", buf[which], PrintNode(' ', Varray[(int)perm[j]]));
+	char jbuf[BUFSIZ];
+	sprintf(buf[1-which], "%s%s", buf[which], PrintNode(jbuf, ' ', Varray[(int)perm[j]]));
 	which=1-which;
     }
     if(_G->weight) {
 	sprintf(buf[1-which], "%s %g", buf[which], weight);
 	which=1-which;
     }
-    return buf[which];
+    strcpy(obuf, buf[which]);
+    return obuf;
 }
 
-char *PrintIndexOrbitsEntry(Gint_type Gint, Gordinal_type GintOrdinal, unsigned Varray[], int k, double w, unsigned char* perm) {
+char *PrintIndexOrbitsEntry(char obuf[], Gint_type Gint, Gordinal_type GintOrdinal, unsigned Varray[], int k, double w, unsigned char* perm) {
     int j;
-    static SET* printed;
-    if(!printed) printed = SetAlloc(k);
-    SetEmpty(printed);
+    SET *printed = SetAlloc(k);
 #if SORT_INDEX_MODE
     VarraySort(Varray, k);
     for(j=0;j<k;j++) perm[j]=j;
 #else
     assert(PERMS_CAN2NON); // Apology("Um, don't we need to check PERMS_CAN2NON? See outputODV for correct example");
 #endif
-    static char buf[2][BUFSIZ];
+    char buf[2][BUFSIZ];
     int which=0;
-    strcpy(buf[which], PrintGraphletID(Gint));
+    PrintGraphletID(buf[which], Gint);
     for(j=0;j<k;j++) if(!SetIn(printed,j))
     {
-	which=1-which; sprintf(buf[which], "%s%s", buf[1-which], PrintNode(' ', Varray[(int)perm[j]]));
+	char jbuf[BUFSIZ];
+	which=1-which; sprintf(buf[which], "%s%s", buf[1-which], PrintNode(jbuf, ' ', Varray[(int)perm[j]]));
 	SetAdd(printed, j);
 	int j1;
 	for(j1=j+1;j1<k;j1++) if(_orbitList[GintOrdinal][j1] == _orbitList[GintOrdinal][j])
 	{
 	    assert(!SetIn(printed, j1));
-	    which=1-which; sprintf(buf[which], "%s%s", buf[1-which], PrintNode(':', Varray[(int)perm[j1]]));
+	    which=1-which; sprintf(buf[which], "%s%s", buf[1-which], PrintNode(jbuf, ':', Varray[(int)perm[j1]]));
 	    SetAdd(printed, j1);
 	}
     }
@@ -219,12 +222,17 @@ char *PrintIndexOrbitsEntry(Gint_type Gint, Gordinal_type GintOrdinal, unsigned 
 	sprintf(buf[1-which], "%s %g", buf[which], w);
 	which=1-which;
     }
-    return buf[which];
+    SetFree(printed);
+    strcpy(obuf, buf[which]);
+    return obuf;
 }
 
-void ProcessNodeOrbitNeighbors(GRAPH *G, Gint_type Gint, Gordinal_type GintOrdinal, unsigned Varray[], TINY_GRAPH *g, int k, double w, unsigned char* perm)
+void ProcessNodeOrbitNeighbors(GRAPH *G, Gint_type Gint, Gordinal_type GintOrdinal, unsigned Varray[], TINY_GRAPH *g, int k, double w, unsigned char* perm, Accumulators *accums)
 {
-    _G=G;
+    if(!accums->communityNeighbors) accums->communityNeighbors=(SET***) Calloc(G->n, sizeof(SET**)); // if communityNeighbors is a null pointer allocate it
+    SET*** _tCommunityNeighbors=accums->communityNeighbors;
+    if(_G) assert(_G == G); // only allowed to set it once
+    else _G=G;
     assert(TinyGraphDFSConnected(g,0));
     int c,d; // canonical nodes
 #if SORT_INDEX_MODE
@@ -235,21 +243,21 @@ void ProcessNodeOrbitNeighbors(GRAPH *G, Gint_type Gint, Gordinal_type GintOrdin
 #endif
     for(c=0;c<k;c++)
     {
-	// FIXME: This could be made more memory efficient by indexing ONLY the CONNECTED canonicals, but...
-	int u=Varray[(int)perm[c]], u_orbit=_orbitList[GintOrdinal][c];
-	ODV(u, u_orbit)+=w;
-	for(d=c+1;d<k;d++) if(TinyGraphAreConnected(g,c,d)) {
-	    // to avoid crossing a cut edge, make sure d can get us everywhere in g without using c
-	    // FIXME: this should be pre-computed ONCE
-	    static TINY_GRAPH gg; TinyGraphCopy(&gg, g);
-	    TinyGraphDisconnect(&gg,c,d); TinyGraphDisconnect(&gg,d,c);
-	    if(TinyGraphDFSConnected(&gg,d)) {
-		int v=Varray[(int)perm[d]]; // v_orbit=_orbitList[GintOrdinal][d];
-		if(!_communityNeighbors[u]) _communityNeighbors[u] = (SET**) Calloc(_numOrbits, sizeof(SET*));
-		if(!_communityNeighbors[u][u_orbit]) _communityNeighbors[u][u_orbit] = SetAlloc(G->n);
-		SetAdd(_communityNeighbors[u][u_orbit], v);
-	    }
-	}
+        // FIXME: This could be made more memory efficient by indexing ONLY the CONNECTED canonicals, but...
+        int u=Varray[(int)perm[c]], u_orbit=_orbitList[GintOrdinal][c];
+        accums->orbitDegreeVector[u_orbit][u]+=w;
+        for(d=c+1;d<k;d++) if(TinyGraphAreConnected(g,c,d)) {
+            // to avoid crossing a cut edge, make sure d can get us everywhere in g without using c
+            // FIXME: this should be pre-computed ONCE
+            TINY_GRAPH gg; TinyGraphCopy(&gg, g);
+            TinyGraphDisconnect(&gg,c,d); TinyGraphDisconnect(&gg,d,c);
+            if(TinyGraphDFSConnected(&gg,d)) {
+                int v=Varray[(int)perm[d]]; // v_orbit=_orbitList[GintOrdinal][d];
+                if(!_tCommunityNeighbors[u]) _tCommunityNeighbors[u] = (SET**) Calloc(_numOrbits, sizeof(SET*));
+                if(!_tCommunityNeighbors[u][u_orbit]) _tCommunityNeighbors[u][u_orbit] = SetAlloc(G->n);
+                SetAdd(_tCommunityNeighbors[u][u_orbit], v);
+            }
+        }
     }
 }
 
@@ -261,9 +269,12 @@ void ProcessNodeOrbitNeighbors(GRAPH *G, Gint_type Gint, Gordinal_type GintOrdin
 	int item = (_communityMode=='o' ? u_connectedOrb : _canon2connectedIndex[GintOrdinal]);
 #endif
 
-void ProcessNodeGraphletNeighbors(GRAPH *G, Gint_type Gint, Gordinal_type GintOrdinal, unsigned Varray[], TINY_GRAPH *g, int k, double w, unsigned char* perm)
+void ProcessNodeGraphletNeighbors(GRAPH *G, Gint_type Gint, Gordinal_type GintOrdinal, unsigned Varray[], TINY_GRAPH *g, int k, double w, unsigned char* perm, Accumulators *accums)
 {
-    _G=G;
+    if(!accums->communityNeighbors) accums->communityNeighbors=(SET***) Calloc(G->n, sizeof(SET**)); // if communityNeighbors is a null pointer allocate it
+    SET*** _tCommunityNeighbors=accums->communityNeighbors;
+    if(_G) assert(_G == G); // only allowed to set it once
+    else _G=G;
     assert(TinyGraphDFSConnected(g,0));
     int c,d; // canonical nodes
 #if SORT_INDEX_MODE
@@ -275,27 +286,28 @@ void ProcessNodeGraphletNeighbors(GRAPH *G, Gint_type Gint, Gordinal_type GintOr
 #endif
     for(c=0;c<k;c++)
     {
-	// FIXME: This could be made more memory efficient by indexing ONLY the CONNECTED canonicals, but...
-	int u=Varray[(int)perm[c]];
-	GDV(u, GintOrdinal)+=w;
-	for(d=c+1;d<k;d++) if(TinyGraphAreConnected(g,c,d)) {
-	    // to avoid crossing a cut edge, make sure d can get us everywhere in g without using c
-	    // FIXME: this should be pre-computed ONCE
-	    static TINY_GRAPH gg; TinyGraphCopy(&gg, g);
-	    TinyGraphDisconnect(&gg,c,d); TinyGraphDisconnect(&gg,d,c);
-	    if(TinyGraphDFSConnected(&gg,d)) {
-		int v=Varray[(int)perm[d]];
-		if(!_communityNeighbors[u]) _communityNeighbors[u] = (SET**) Calloc(_numCanon, sizeof(SET*));
-		if(!_communityNeighbors[u][GintOrdinal]) _communityNeighbors[u][GintOrdinal] = SetAlloc(G->n);
-		SetAdd(_communityNeighbors[u][GintOrdinal], v);
-	    }
-	}
+        // FIXME: This could be made more memory efficient by indexing ONLY the CONNECTED canonicals, but...
+        int u=Varray[(int)perm[c]];
+        accums->graphletDegreeVector[GintOrdinal][u]+=w;
+        for(d=c+1;d<k;d++) if(TinyGraphAreConnected(g,c,d)) {
+            // to avoid crossing a cut edge, make sure d can get us everywhere in g without using c
+            // FIXME: this should be pre-computed ONCE
+            TINY_GRAPH gg; TinyGraphCopy(&gg, g);
+            TinyGraphDisconnect(&gg,c,d); TinyGraphDisconnect(&gg,d,c);
+            if(TinyGraphDFSConnected(&gg,d)) {
+                int v=Varray[(int)perm[d]];
+                if(!_tCommunityNeighbors[u]) _tCommunityNeighbors[u] = (SET**) Calloc(_numCanon, sizeof(SET*));
+                if(!_tCommunityNeighbors[u][GintOrdinal]) _tCommunityNeighbors[u][GintOrdinal] = SetAlloc(G->n);
+                SetAdd(_tCommunityNeighbors[u][GintOrdinal], v);
+            }
+        }
     }
 }
 
-Boolean ProcessGraphlet(GRAPH *G, SET *V, unsigned Varray[], const int k, TINY_GRAPH *g, double weight)
+Boolean ProcessGraphlet(GRAPH *G, SET *V, unsigned Varray[], const int k, TINY_GRAPH *g, double weight, Accumulators *accums)
 {
-    _G=G;
+    if(_G) assert(_G == G); // only allowed to set it once
+    else _G=G;
     Boolean processed = true;
     TinyGraphInducedFromGraph(g, G, Varray);
     Gint_type Gint = TinyGraph2Int(g,k);
@@ -305,55 +317,65 @@ Boolean ProcessGraphlet(GRAPH *G, SET *V, unsigned Varray[], const int k, TINY_G
 #if PARANOID_ASSERTS
     assert(0 <= GintOrdinal && GintOrdinal < _numCanon);
 #endif
-
-    if(_canonNumStarMotifs[GintOrdinal] == -1) { // initialize this graphlet's star motif count
+    // _canonNumStarMotifs was previously computed during sampling rather than pre-computed
+    if(accums->canonNumStarMotifs[GintOrdinal] == -1) { // initialize this graphlet's star motif count
 	int i;
-	_canonNumStarMotifs[GintOrdinal] = 0;
-	for(i=0; i<_k; i++) if(TinyGraphDegree(g,i) == k-1) ++_canonNumStarMotifs[GintOrdinal];
+	accums->canonNumStarMotifs[GintOrdinal] = 0;
+	for(i=0; i<_k; i++) if(TinyGraphDegree(g,i) == k-1) ++accums->canonNumStarMotifs[GintOrdinal];
     }
     // ALWAYS count the frequencies; we may normalize the counts later using absolute graphlet or motif counts.
-    _graphletCount[GintOrdinal]+=weight;
+    accums->graphletCount[GintOrdinal]+=weight;
+    // TODO: TO WORK WITH PRECISION BASED SAMPLING, THIS MUST BE MADE NON-REENTRANT, ADDED TO THE GLOBAL ACCUMULATORS
     ++_batchRawCount[GintOrdinal]; ++_batchRawTotalSamples;
 
-    switch(_outputMode)
-    {
-    case graphletFrequency: break; // already counted above
-    case indexGraphlets: case indexGraphletsRNO:
+    // case graphletFrequency: break; // already counted above
+    if(_outputMode & indexGraphlets || _outputMode&indexGraphletsRNO) {
+	char buf[BUFSIZ];
 	if(NodeSetSeenRecently(G, Varray,k) ||
 	    (_sampleMethod == SAMPLE_INDEX && !SetIn(_windowRep_allowed_ambig_set, GintOrdinal)) ||
 	    _canonNumEdges[GintOrdinal] < _min_edge_count) processed=false;
-	else puts(PrintIndexEntry(Gint, GintOrdinal, Varray, k, weight, perm));
-	break;
-    case predict:
+	else puts(PrintIndexEntry(buf, Gint, GintOrdinal, Varray, k, weight, perm));
+    }
+    if(_outputMode & predict) {
 	assert(!G->weight);
 	if(NodeSetSeenRecently(G,Varray,k)) processed=false;
-	else Predict_AccumulateMotifs(G,Varray,g,Gint,GintOrdinal);
-	break;
-    case indexOrbits:
+	else Predict_ProcessGraphlet(G,Varray,g,Gint,GintOrdinal);
+    }
+    if(_outputMode & indexOrbits) {
 	assert(TinyGraphDFSConnected(g,0));
+	char buf[BUFSIZ];
 	if(NodeSetSeenRecently(G,Varray,k) ||
 	    (_sampleMethod == SAMPLE_INDEX && !SetIn(_windowRep_allowed_ambig_set, GintOrdinal))) processed=false;
-	else puts(PrintIndexOrbitsEntry(Gint, GintOrdinal, Varray, k, weight, perm));
-	break;
-    case communityDetection:
-	if(_canonNumEdges[GintOrdinal] < _min_edge_count) processed=false;
-	else if(_communityMode == 'o') ProcessNodeOrbitNeighbors(G, Gint, GintOrdinal, Varray, g, k, weight, perm);
-	else if(_communityMode == 'g') ProcessNodeGraphletNeighbors(G, Gint, GintOrdinal, Varray, g, k, weight, perm);
-	else Fatal("unkwown _communityMode %c", _communityMode);
-	break;
-    case outputGDV:
-	for(j=0;j<k;j++) GDV(Varray[j], GintOrdinal)+=weight;
-	break;
-    case outputODV:
-#if PERMS_CAN2NON
-	for(j=0;j<k;j++) ODV(Varray[(int)perm[j]], _orbitList[GintOrdinal][          j ])+=weight;
-#else
-	for(j=0;j<k;j++) ODV(Varray[          j ], _orbitList[GintOrdinal][(int)perm[j]])+=weight;
-#endif
-	break;
-
-    default: Abort("ProcessGraphlet: unknown or un-implemented outputMode %d", _outputMode);
-	break;
+	else puts(PrintIndexOrbitsEntry(buf, Gint, GintOrdinal, Varray, k, weight, perm));
     }
+    if(_outputMode & communityDetection) {
+	if(_canonNumEdges[GintOrdinal] < _min_edge_count) processed=false;
+	else if(_communityMode == 'o') ProcessNodeOrbitNeighbors(G, Gint, GintOrdinal, Varray, g, k, weight, perm, accums);
+	else if(_communityMode == 'g') ProcessNodeGraphletNeighbors(G, Gint, GintOrdinal, Varray, g, k, weight, perm, accums);
+	else Fatal("unkwown _communityMode %c", _communityMode);
+    }
+
+    // the macros GDV and ODV access the global array and are thus only used in single thread (_MCMC_EVERY_EDGE) modes
+    if (_MCMC_EVERY_EDGE || (_sampleMethod != SAMPLE_MCMC && _sampleMethod != SAMPLE_NODE_EXPANSION && 
+        _sampleMethod != SAMPLE_EDGE_EXPANSION)) {
+        if(_outputMode & outputGDV) {
+        for(j=0;j<k;j++) GDV(Varray[j], GintOrdinal)+=weight;
+        // for(j=0;j<k;j++) accums->graphletDegreeVector[GintOrdinal][Varray[j]] += weight;
+        }
+
+        if(_outputMode & outputODV) {
+        #if PERMS_CAN2NON
+        // for(j=0;j<k;j++) ODV(Varray[(int)perm[j]], _orbitList[GintOrdinal][          j ])+=weight;
+        for(j=0;j<k;j++) accums->orbitDegreeVector[_orbitList[GintOrdinal][           j]][Varray[(int)perm[j]]]+=weight;
+        #else
+        for(j=0;j<k;j++) ODV(Varray[          j ], _orbitList[GintOrdinal][(int)perm[j]])+=weight;
+        // for(j=0;j<k;j++) accums->orbitDegreeVector[_orbitList[GintOrdinal][(int)perm[j]]][Varray[(int)perm[j]]]+=weight;
+        #endif
+        }
+    }
+
+
+    if(!_outputMode) Abort("ProcessGraphlet: unknown or un-implemented outputMode %d", _outputMode);
+
     return processed;
 }

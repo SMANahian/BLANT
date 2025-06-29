@@ -33,7 +33,7 @@
 #endif
 
 typedef unsigned char kperm[3]; // 3 bits per permutation, max 8 permutations = 24 bits
-#define Bk (1 <<(kk*(kk-1)/2 + kk*SELF_LOOPS))
+#define Bk (1U <<(kk*(kk-1)/2 + kk*SELF_LOOPS))
 Gordinal_type K[Bk];
 kperm Permutations[Bk];
 static Gint_type canon_list[MAX_CANONICALS];
@@ -63,7 +63,7 @@ static int siCmp(const void *A, const void *B)
     return 0;
 }
 
-Gordinal_type canon2ordinal(int numCanon, Gint_type *_canon_list, int canonical)
+Gordinal_type canon2ordinal(Gordinal_type numCanon, Gint_type *_canon_list, Gint_type canonical)
 {
     Gint_type *found = bsearch(&canonical, _canon_list, numCanon, sizeof(_canon_list[0]), siCmp);
     return found-_canon_list;
@@ -76,10 +76,13 @@ int main(int argc, char *argv[])
 #if SELF_LOOPS
     if (kk>7) Fatal("cannot create_bin_data for k>7 when SELF_LOOPS is 1");
 #endif
+    SetBlantDirs();
+    fprintf(stderr, "Note: Gint_type is size %lu bytes (%lu bits); Gordinal_type is %lu (%lu bits)\n",
+	sizeof(Gint_type), 8*sizeof(Gint_type), sizeof(Gordinal_type), 8*sizeof(Gordinal_type));
     SET *connectedCanonicals = canonListPopulate(buf, canon_list, kk, canon_num_edges);
     int numCanon = connectedCanonicals->maxElem;
     SetFree(connectedCanonicals);
-    sprintf(buf, "%s/%s/canon_map%s.txt", _BLANT_DIR, CANON_DIR, kString);
+    sprintf(buf, "%s/%s/canon_map%s.txt", _BLANT_DIR, _CANON_DIR, kString);
     FILE *fp=fopen(buf,"r");
     assert(fp);
     int line;
@@ -115,11 +118,11 @@ int main(int argc, char *argv[])
     }
     fprintf(stderr, "Finished reading ASCII files; now writing binary ones\n"); fflush(stderr);
     fclose(fp);
-    sprintf(buf, "%s/%s/canon_map%s.bin", _BLANT_DIR, CANON_DIR, kString);
+    sprintf(buf, "%s/%s/canon_map%s.bin", _BLANT_DIR, _CANON_DIR, kString);
     fp=fopen(buf,"wb");
     fwrite((void*)K,sizeof(K[0]),Bk,fp);
     fclose(fp);
-    sprintf(buf, "%s/%s/perm_map%s.bin", _BLANT_DIR, CANON_DIR, kString);
+    sprintf(buf, "%s/%s/perm_map%s.bin", _BLANT_DIR, _CANON_DIR, kString);
     fp=fopen(buf,"wb");
     fwrite((void*)Permutations,sizeof(Permutations[0]),Bk,fp);
     fclose(fp);
