@@ -130,16 +130,16 @@ void SetGlobalCanonMaps(void)
     char BUF[BUFSIZ];
     assert(3 <= _k && _k <= MAX_K);
 #if SELF_LOOPS
-    _Bk = (1 <<(_k*(_k+1)/2));
+    _Bk = (1U <<(_k*(_k+1)/2));
 #else
-    _Bk = (1 <<(_k*(_k-1)/2));
+    _Bk = (1U <<(_k*(_k-1)/2));
 #endif
     _connectedCanonicals = canonListPopulate(BUF, _canonList, _k, _canonNumEdges);
     _numCanon = _connectedCanonicals->maxElem;
     _numConnectedCanon = SetCardinality(_connectedCanonicals);
     _numOrbits = orbitListPopulate(BUF, _orbitList, _orbitCanonMapping, _orbitCanonNodeMapping, _numCanon, _k);
     _K = (Gordinal_type*) mapCanonMap(BUF, _K, _k);
-    sprintf(BUF, "%s/%s/perm_map%d.bin", _BLANT_DIR, CANON_DIR, _k);
+    sprintf(BUF, "%s/%s/perm_map%d.bin", _BLANT_DIR, _CANON_DIR, _k);
     int pfd = open(BUF, 0*O_RDONLY);
     if(pfd>=0) {
 	Permutations = (kperm*) mmap(Permutations, sizeof(kperm)*_Bk, PROT_READ, MAP_PRIVATE, pfd, 0);
@@ -149,7 +149,7 @@ void SetGlobalCanonMaps(void)
     for (i=0; i < _numOrbits; i++)
 	if (SetIn(_connectedCanonicals, _orbitCanonMapping[i]))
 	    _connectedOrbits[_numConnectedOrbits++] = i;
-    if ((_outputMode == outputODV && _k == 4) || _k == 5)
+    if ((_outputMode & outputODV && _k == 4) || _k == 5)
 	orcaOrbitMappingPopulate(BUF, _orca_orbit_mapping, _k);
 }
 
@@ -178,13 +178,13 @@ void LoadMagicTable(void)
 // There is the inverse transformation, called "EncodePerm", in createBinData.c.
 Gordinal_type ExtractPerm(unsigned char perm[_k], Gint_type Gint)
 {
-    if(Permutations) {
+    if(_k <= BASE_K) {
 	int j, i32 = 0;
 	for(j=0;j<3;j++) i32 |= (Permutations[Gint][j] << j*8);
 	for(j=0;j<_k;j++)
 	    perm[j] = (i32 >> 3*j) & 7;
 	return _K[Gint];
-    } else return canon_to_ordinal(smaller_canon_map(Gint, _k, perm), _k);
+    } else return Predict_canon_to_ordinal(Predict_canon_map(Gint, _k, perm), _k);
 }
 
 void InvertPerm(unsigned char inv[_k], const unsigned char perm[_k])
@@ -289,4 +289,10 @@ int orbitpair_cmp(long int a, long int b) {
 
 long int orbitpair_copy(long int src) {
     return src;
+}
+
+int NumOrbits(Gordinal_type ord) {
+    assert(0<=ord && ord<_numCanon);
+    if(ord==0 || ord==_numCanon-1) return 1; // the clique and indep set each have only 1 orbit
+    else return _orbitList[ord+1][0] - _orbitList[ord][0];
 }

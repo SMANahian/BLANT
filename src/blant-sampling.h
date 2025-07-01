@@ -1,6 +1,7 @@
 #ifndef BLANT_SAMPLING_H
 #define BLANT_SAMPLING_H
 #include "blant.h"
+#include "blant-pthreads.h"
 #include "heap.h"
 #include "graph.h"
 #include "queue.h"
@@ -25,7 +26,7 @@
 #define SAMPLE_FAYE 6
 #define SAMPLE_INDEX 7 // Use deterministic walk to find seeds which are used for extensions
 #define SAMPLE_MCMC_EC 8 // cover all edges in G at least once, then stop
-#define SAMPLE_SEQUENTIAL_CHAINING 9 // sample by performing edge chaining
+// #define SAMPLE_SEQUENTIAL_CHAINING 9 // sample by performing edge chaining
 
 extern int _sampleMethod, _sampleSubmethod;
 extern FILE *_sampleFile; // if _sampleMethod is SAMPLE_FROM_FILE
@@ -39,18 +40,21 @@ extern Boolean _MCMC_EVERY_EDGE; // Should MCMC restart at each edge
 extern GRAPH *_EDGE_COVER_G;
 
 // Each of these samples a graphlet and return its weight (default 1 unless _weighted)
-double SampleGraphletNodeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC);
+// Any of the sampling functinos that takes Accumulators as a parameter has been made non-reentrant; work on making them all this way
+// Do this regardless of whether or not the function can only conceptually work in one thread anyway (ie MCMC)
+double SampleGraphletNodeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC, Accumulators *accums);
 double SampleGraphletFaye(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC);
 double SampleGraphletFromFile(GRAPH *G, SET *V, unsigned *Varray, int k);
-double SampleGraphletEdgeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC);
+double SampleGraphletEdgeBasedExpansion(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC, Accumulators *accums);
 double SampleGraphletLuBressanReservoir(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC);
 double SampleGraphletAcceptReject(GRAPH *G, SET *V, unsigned *Varray, int k);
-double SampleGraphletMCMC(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC);
+double SampleGraphletMCMC(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC, Accumulators *accums);
+double SampleGraphletSequentialEdgeChaining(GRAPH *G, SET *V, unsigned *Varray, int k, int whichCC, Accumulators *accums);
 double SampleGraphletLuBressan_MCMC_MHS_without_Ooze(GRAPH *G, SET *V, unsigned *Varray, int k);
 double SampleGraphletLuBressan_MCMC_MHS_with_Ooze(GRAPH *G, SET *V, unsigned *Varray, int k);
 void SampleGraphletIndexAndPrint(GRAPH* G, unsigned *prev_nodes_array, int prev_nodes_count, double *heur_arr); // returns void instead of double because this function isn't called in SampleGraphlet
 void WalkLSteps(MULTISET *XLS, QUEUE *XLQ, int* X, GRAPH *G, int k, int cc, int edge);
-double SampleGraphlet(GRAPH *G, SET *V, unsigned Varray[], int k, int cc); // call with cc=G->n to allow unbiased choice
+double SampleGraphlet(GRAPH *G, SET *V, unsigned Varray[], int k, int cc, Accumulators *accums); // call with cc=G->n to allow unbiased choice
 void initializeSlidingWindow(MULTISET *XLS, QUEUE *XLQ, int* X, GRAPH *G, int windowSize, int edge);
 void crawlOneStep(MULTISET *XLS, QUEUE *XLQ, int* X, GRAPH *G);
 int *MCMCGetNeighbor(int *Xcurrent, GRAPH *G);

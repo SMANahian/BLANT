@@ -3,22 +3,25 @@
 BASENAME=`basename "$0" .sh`; TAB='	'; NL='
 '
 #################### ADD YOUR USAGE MESSAGE HERE, and the rest of your code after END OF SKELETON ##################
-USAGE="USAGE: $BASENAME [OPTIONS] blant_cmd mu Ks EDs network.el
+USAGE="USAGE: $BASENAME [OPTIONS] blant_cmd Ks EDs network.el
 PURPOSE: use random samples of k-graphlets from BLANT in attempt to find large communities in network.el.
 REQUIRED ARGUMENTS:
     blant_cmd is the raw BLANT command; usually it's just './blant', but can include options (eg './blant -C')
-    mu is the mean number of times each *node* should be touched by a graphlet sample, so BLANT will thus take
-	mu*(n/k) total samples of k-node graphlets.
     Ks is a list of graphlet sizes to do BLANT sampling in
     EDs is a list of the edge density thresholds to explore
 OPTIONS (added BEFORE the blant.exe name)
     -D DIR: use existing blant output files in directory DIR
+    -T DIR: use temp space here rather than /tmp
     -A: Use Sweta Jain's Turan's Shadow code to estimate absolute counts
-    -C: run on the complement graph, G'
+    -C: run on the complement graph, G' (careful, this can cause long run times)
     -1: exit after printing only one 1 cluster (the biggest one)
     -h: use only the highest count graphlet/orbit for neighbors
     -S: cluster count sorted by the normalized square
     -w: networks are edge-weighted; pass -w to BLANT to use weighted graphlets
+    -v: verbose output
+    -nm: 'no members': suppress list of nodes in the community
+    -pD: tell BLANT to estimate graphlet counts with D digits of precision (default 1)
+    -nN: tell BLANT to take exactly N samples (mutually exclusive with -p above)
     -r SEED: use the integer SEED as the random seed
     -emt value: minimum edge mean threshold: the smallest average-over-edgeWeights for a cluster to be included [default 0.5]
     -m smallest: if m>=1, ignore clusters/cliques/communities with fewer than this number of nodes; otherwise if m<1, treat
@@ -30,10 +33,9 @@ OPTIONS (added BEFORE the blant.exe name)
 	cluster (though it can overlap by more than this with MULTIPLE previous clusters). If it overlaps more than this with
 	any ONE previous cluster, it is discarded.
 PREDICTION
-    -pN: perform edge prediction of up to N edges for each node on the 'periphery' of a communty because it has
+    -PN: perform edge prediction of up to N edges for each node on the 'periphery' of a communty because it has
 	as many as N too few edges into the community to be added; prediction seems to work better with larger
-	k, with k=8 working best at high edge densities, though lower k works OK for lower edge densities;
-	significantly increasing mu also appears to help (eg 10000 or even 100000).
+	k, with k=8 working best at high edge densities, though lower k works OK for lower edge densities.
 	NOTE: predicted edges are sent to the standard error stream (aka stderr, cerr, Unix file descriptor 2),
 	so they do not litter the pipeline. To view them, it's best to run $BASENAME with '2>&1 >/dev/null'
 	appended to its command line."
@@ -51,11 +53,6 @@ not(){ if eval "$@"; then return 1; else return 0; fi; }
 newlines(){ awk '{for(i=1; i<=NF;i++)print $i}' "$@"; }
 parse(){ awk "BEGIN{print $*}" </dev/null; }
 
-# Temporary Filename + Directory (both, you can use either, note they'll have different random stuff in the XXXXXX part)
-TMPDIR=`mktemp -d ${LOCAL_TMP:-"/tmp"}/$BASENAME.XXXXXX`
- trap "/bin/rm -rf $TMPDIR; exit" 0 1 2 3 15 # call trap "" N to remove the trap for signal N
-#echo "TMPDIR is $TMPDIR"
-
 #################### END OF SKELETON, ADD YOUR CODE BELOW THIS LINE
 
 [ $# = 0 ] && usage
@@ -64,24 +61,30 @@ minClusArg=0
 maxClus=2147483647 # 2^31-1
 minEdgeMean=0.5
 RANDOM_SEED=
-BLANT_FILES="$TMPDIR"
 COMMUNITY_MODE=g  # can be g for graphlet (the default if empty), or o for orbit (which uses FAR more memory, like 10-100x)
 SQR_NORM=0
 WEIGHTED=''
 W=''
 ONLY_ONE=0
 exclusive=0
-SAMPLE_METHOD=-sMCMC #-sNBE
+SAMPLE_METHOD=-sEBE #MCMC #-sNBE
 ONLY_BEST_ORBIT=0
 OVERLAP=0.5
 EDGE_PREDICT=0
 COMPLEMENT=''
 TURAN=false
+DEBUG=false # set to true to store BLANT output
+VERBOSE=0
+QUIET=-qq
+PRECISION=-p1L
+PRINT_MEMBERS=1
+DENSITY_LEEWAY=0.95 # factor by which we can _initially_ keep a node in the cluster even though it lowers the density
 
 # ensure the subfinal sort is always the same... we sort by size since the edge density is (roughly) constant
 SUBFINAL_SORT="-k 1nr -k 5n"
+BLANT_FILES=''
 
-while echo "$1" | grep '^-' >/dev/null; do # first argument is an option
+while echo "X$1" | grep '^X-' >/dev/null; do # first argument is an option
     case "$1" in
     -1) ONLY_ONE=1; shift;;
     -h) ONLY_BEST_ORBIT=1; shift;;
@@ -90,8 +93,14 @@ while echo "$1" | grep '^-' >/dev/null; do # first argument is an option
     -s) SAMPLE_METHOD="-s$2"; shift 2;;
     -s*) SAMPLE_METHOD="$1"; shift;;
     -D) BLANT_FILES="$2"; shift 2;;
+    -T) LOCAL_TMP="$2"; shift 2;;
     -A) TURAN=true; shift;;
     -C) COMPLEMENT=-C; shift;;
+    -v) VERBOSE=1; QUIET=''; shift;;
+    -nm) PRINT_MEMBERS=0; shift;;
+    -n) PRECISION="-n $2"; shift 2;;
+    -n[0-9]*) PRECISION="$1"; shift;;
+    -p[0-9]*) PRECISION="$1"L; shift;;
     -r) RANDOM_SEED="-r $2"; shift 2;;
     -emt) minEdgeMean="$2"; shift 2;;
     -r[0-9]*) RANDOM_SEED="$1"; shift 1;; # allow seed to be same or separate argument
@@ -101,20 +110,25 @@ while echo "$1" | grep '^-' >/dev/null; do # first argument is an option
     -M[0-9]*) maxClus="`echo $1|sed 's/^-m//'`"; shift 1;;
     -o) OVERLAP="$2"; shift 2;;
     -o[0-9]*) OVERLAP="`echo $1|sed 's/^-o//'`"; shift 1;;
-    -p[0-9]*) EDGE_PREDICT="`echo $1|sed 's/^-p//'`"; shift 1;;
+    -P[0-9]*) EDGE_PREDICT="`echo $1|sed 's/^-P//'`"; shift 1;;
     -*) die "unknown option '$1'";;
     esac
 done
 
-[ $# -ne 5 ] && die "expecting exactly 5 mandatory arguments, but you supplied $#"
+[ $# -ne 4 ] && die "expecting exactly 4 mandatory arguments, but you supplied $#"
 
-BLANT_CMD="$1";
+# Temporary Filename + Directory (both, you can use either, note they'll have different random stuff in the XXXXXX part)
+TMPDIR=`mktemp -d ${LOCAL_TMP:-"/tmp"}/$BASENAME.XXXXXX`
+ trap "/bin/rm -rf $TMPDIR; exit" 0 1 2 3 15 # call trap "" N to remove the trap for signal N
+echo "TMPDIR is $TMPDIR" >&2
+[ "$BLANT_FILES" ] || BLANT_FILES="$TMPDIR"
+
+BLANT_CMD="$1 ${PRECISION} $QUIET";
 BLANT_EXE=`echo $BLANT_CMD | awk '{print $1}'`
-mu=$2;
-Ks=(`echo $3 | newlines | sort -nr`); # sort the Ks highest to lowest so the below parallel runs start the higher values of k first
+Ks=(`echo $2 | newlines | sort -nr`); # sort the Ks highest to lowest so the below parallel runs start the higher values of k first
 #[ `echo "${Ks[@]}" | wc -w` -eq 1 ] || die "no more multiple K's at the same time"
-EDs=($4)
-net=$5
+EDs=($3)
+net=$4
 
 if [ "$COMPLEMENT" != "" ]; then
     #SAMPLE_METHOD=-sNBE # only method that works for now
@@ -147,13 +161,11 @@ case "$net" in
 *.elw) [ "X$WEIGHTED" = "X-w" ] || die "weighted edgelist given without -w option";;
 *) die "network '$net' must be an edgeList file ending in .el";;
 esac
-DEBUG=false # set to true to store BLANT output
 
 # Pre-run the BLANTs for each k, and re-use the files for each edge density.
 BLANT_EXIT_CODE=0
 if [ "$BLANT_FILES" = "$TMPDIR" ]; then
     for k in "${Ks[@]}"; do
-	n=`hawk "BEGIN{print int($mu * $numNodes / $k)}"`
 	#minEdges=`hawk 'BEGIN{edC='$EDGE_DENSITY_THRESHOLD'*choose('$k',2);rounded_edC=int(edC); if(rounded_edC < edC){rounded_edC++;} print rounded_edC}'`
 	# Use MCMC because it gives asymptotically correct concentrations *internally*, and that's what we're using now.
 	# DO NOT USE -mi since it will NOT output duplicates, thus messing up the "true" graphlet frequencies/concentrations
@@ -162,7 +174,7 @@ if [ "$BLANT_FILES" = "$TMPDIR" ]; then
 	ABSOLUTE_CLIQUE_COUNT=""
 	CMD=""
 	$TURAN && CMD="./scripts/absolute-clique-count.sh $k $net > $TMPDIR/ACC 2>/dev/null &&"'ABSOLUTE_CLIQUE_COUNT="-A `cat $TMPDIR/ACC`";'
-	CMD="$CMD $BLANT_CMD $WEIGHTED $ABSOLUTE_CLIQUE_COUNT $COMPLEMENT $RANDOM_SEED -k$k -n$n $SAMPLE_METHOD -mc$COMMUNITY_MODE $net"
+	CMD="$CMD $BLANT_CMD $WEIGHTED $ABSOLUTE_CLIQUE_COUNT $COMPLEMENT $RANDOM_SEED -k$k $SAMPLE_METHOD -mc$COMMUNITY_MODE $net"
 	eval $CMD > $TMPDIR/blant$k.out &
     done
 fi
@@ -179,8 +191,8 @@ for edgeDensity in "${EDs[@]}"; do
 	    BEGIN{ edC='$edgeDensity'*choose('$k',2); onlyBestOrbit='$ONLY_BEST_ORBIT';
 		cMode="'$COMMUNITY_MODE'"; if(cMode=="") cMode=="g"; # graphlet uses FAR less RAM
 		ASSERT(cMode=="g" || cMode=="o", "COMMUNITY_MODE must be o or g, not "cMode);
-		rounded_edC=int(edC); if(rounded_edC < edC) rounded_edC++;
-		minEdges=MAX(rounded_edC, ('$k'-1))
+		rounded_edC=int(edC); if(rounded_edC == edC) --rounded_edC; # allow one edge less than eps
+		minEdges=MAX(rounded_edC, ('$k')-1)
 	    }
 	    ARGIND==1 && FNR>1 && $2 {canonEdges[FNR-2]=$3}
 	    ARGIND==2 && FNR>1 && ((FNR-2) in canonEdges) {for(i=1;i<=NF;i++)orbit2canon[$i]=FNR-2}
@@ -200,23 +212,23 @@ for edgeDensity in "${EDs[@]}"; do
 	    }
 	    END {
 		for(u in Kc) for(item in Kc[u]) if(item) { # do not use item==0
-		    ORS=" "
+		    ORS=" " # Output Record Separator = space, so all the following goes on one line
 		    if('$SQR_NORM') print Kc[u][item]^2/T[u], u, item
 		    else            print Kc[u][item], u, item # print the cluster membership count, and the node
 		    for(v in graphletNeighbors[u][item]) print v
-		    ORS="\n"; print "";
+		    ORS="\n"; print ""; # finally print the newline
 		}
 	    }' canon_maps/canon_list$k.txt canon_maps/orbit_map$k.txt $BLANT_FILES/blant$k.out |
-	sort -gr | # > $BLANT_FILES/clus$k.sorted  # sorted [weighted] cluster-counts of all the nodes, largest-to-smallest
+	sort -T $TMPDIR -gr | # > $BLANT_FILES/clus$k.sorted  # sorted [weighted] cluster-counts of all the nodes, largest-to-smallest
 	hawk ' # build the actual communities; may require huge amounts of RAM and CPU, eg 10GB and 12-24h for 9wiki-topcats
 	    BEGIN{if("'$RANDOM_SEED'") srand('$RANDOM_SEED');else Srand();OFS="\t"; ID=0; edgePredict='"$EDGE_PREDICT"';
 		M=1*'$minClusArg'; if(M>=1) minClus=M;
 		else {
 		    m='$numEdges'; n='$numNodes'; eps=m/choose(n,2);
-		    if(M>0) pVal=M; else pVal=1/choose(n,2)^2; # heuristic to make pVal small enough to get significant clusters
+		    if(M>0)pVal=M;else pVal=1/choose(n,2)^2; # heuristic to make pVal small enough to get significant clusters
 		    for(e=1;e<m;e++)if(eps^e<pVal) break;
-		    for(minClus=2;minClus<n;minClus++) if('$edgeDensity'*choose(minClus,2)>e) break;
-		    printf "minClus %d (%d edges = pVal %g < %g for ED %g)\n", minClus, e, eps^e, pVal, eps >"/dev/stderr"
+		    for(minClus=2;minClus<n;minClus++) if('$edgeDensity'*choose(minClus,2)>=e) break;
+		    if('$VERBOSE') printf "minClus %d (%d edges = pVal %g < %g for ED %g)\n", minClus, e, eps^e, pVal, eps >"/dev/stderr"
 		}
 		ASSERT(minClus>=1,"minClus "minClus" must be >=1");
 	    }
@@ -224,9 +236,9 @@ for edgeDensity in "${EDs[@]}"; do
 		if(NF==2)weight=1; else if(NF==3)weight=$3; else ASSERT(0, "expecting either 2 or 3 columns");
 		degree[$1]+=weight;degree[$2]+=weight;edge[$1][$2]=edge[$2][$1]=weight
 	    }
-	    ARGIND==2 && !($2 in count){ # are we really SURE we should take only the first occurence?
-		item=$3; count[$2]=$1; node[FNR]=$2; line[$2]=FNR;
-		for(i=4; i<=NF; i++) if(edge[$2][$i] > '$minEdgeMean'/2) # heuristing: avoid too-weak edges
+	    ARGIND==2 { # && !($2 in count) # uncomment to take only first occurence--faster but worse result
+		item=$3; count[$2]+=$1; node[FNR]=$2; line[$2]=FNR;
+		for(i=4; i<=NF; i++) if(edge[$2][$i] > '$minEdgeMean'/2) # heuristic: avoid too-weak edges
 		    graphletNeighbors[$2][$i]=graphletNeighbors[$i][$2]=1;
 	    }
 
@@ -249,23 +261,31 @@ for edgeDensity in "${EDs[@]}"; do
 	    function highRelClusCount(u, v) { # Heuristic
 		if(!(u in count) || count[u]==0) return 1;
 		if(!(v in count) || count[v]==0) return 0;
-		if (v in count) return count[v]/count[u]>=0.5;
+		if (v in count) return count[v]/count[u]>=sqrt('$edgeDensity')*0.9; # 0.7 seems about optimal, but 0.5 to 0.9 also work well
 		else return 1/count[u]>=0.5;
 	    }
-	    function AppendNeighbors(u,origin,    v,oldOrder) {
+	    function AppendNeighbors(u,origin,    v,oldOrder, edgesIntoS) {
 		oldOrder=PROCINFO["sorted_in"];
-		PROCINFO["sorted_in"]="randsort";
 		if(u in graphletNeighbors) {
+		    # The following three lines will append the neighbors in order of most edges back into S
+		    # It seems reasonable, but is more expensive seems to have no significant difference. :-(
+		    #for (v in graphletNeighbors[u]) edgesIntoS[v] = EdgesIntoS(v);
+		    #PROCINFO["sorted_in"] = "@val_num_desc"; # for loop through edgesIntoS, largest first
+		    #for (v in edgesIntoS) {
+		    # The default is to append them in random order... no significant difference on small networks
+		    PROCINFO["sorted_in"]="randsort";
 		    for (v in graphletNeighbors[u]) {
 			if(!(v in visitedQ) && (!(v in line) || line[v] > line[origin]) && highRelClusCount(u, v)) {
 			    QueueAdd("Q", v);
 			    visitedQ[v]=1;
 			}
 		    }
+		    PROCINFO["sorted_in"]=oldOrder;
 		}
-		PROCINFO["sorted_in"]=oldOrder;
 	    }
 	    END{n=length(degree); # number of nodes in the input network
+		if('$edgeDensity'==1) density_leeway=1;
+		else density_leeway = '$DENSITY_LEEWAY';
 		# make cluster and started empty sets; started is a list of nodes we should NOT start a new BFS on
 		delete cluster; cluster[0]=1; delete cluster[0];
 		delete started; started[0]=1; delete started[0];
@@ -292,14 +312,17 @@ for edgeDensity in "${EDs[@]}"; do
 			wgtEdgeCount += wgtEdgeHits;
 			S[u]=1;
 			Slen = length(S);
+			ASSERT(Slen > 0, "Slen must be > 0 but is "Slen);
 			if(Slen >= '$maxClus') break;
 			# CAREFUL: calling InducedEdges(S) every QueueNext() is VERY expensive; uncommenting the line below
 			# slows the program by more than 100x (NOT an exaggeration)
 			# WARN(edgeCount == InducedEdges(edge,S),"Slen "Slen" edgeCount "edgeCount" Induced(S) "InducedEdges(edge,S));
 			Sorder[Slen]=u; # no need to delete this element if u fails because Slen will go down by 1
-			if (Slen>1){
+			if (Slen==1)
+			    AppendNeighbors(u, origin);
+			else {
 			    maxEdges = choose(Slen,2);
-			    if(edgeCount/maxEdges < '$edgeDensity') {
+			    if(edgeCount/maxEdges < '$edgeDensity' * density_leeway) {
 				delete S[u]; # u drops the edge density too low, so nuke it
 				if(edgePredict) {
 				    if((edgeCount+edgePredict)/maxEdges >= '$edgeDensity') {
@@ -318,11 +341,10 @@ for edgeDensity in "${EDs[@]}"; do
 				misses=0;
 				AppendNeighbors(u, orign);
 			    }
-			} else
-			    AppendNeighbors(u, origin);
+			}
 		    }
 		    #printf " |S|=%d edgeMean %g", length(S), wgtEdgeCount/(edgeCount?edgeCount:1) > "/dev/stderr"
-		    if(QueueLength("Q")==0 && length(S) > 1 && '$edgeDensity' < 1) { # irrelevant for cliques
+		    if(QueueLength("Q")==0 && length(S) > 1) {
 			# post-process to remove nodes with too low in-cluster degree---quite relevant for lower density
 			# communities where a node may be added because it does not
 			# reduce the *mean* degree of the cluster, but it does not really have sufficiently strong
@@ -332,7 +354,7 @@ for edgeDensity in "${EDs[@]}"; do
 			# The latter was added in response to our performance on the LFR graphs, but it does not appear
 			# to hurt performance anywhere else.
 			StatReset(""); delete degFreq;
-			tmpEdge = InducedEdges(edge,S, degreeInS);
+			tmpEdge = InducedEdges(edge,S, degreeInS); # this call populates degreeInS
 			ASSERT(tmpEdge == edgeCount, "edgeCount "edgeCount" disagrees(1) with InducedEdges of "tmpEdge);
 			for(v in S) { StatAddSample("", degreeInS[v]); ++degFreq[degreeInS[v]];}
 			maxFreq=degMode=0;
@@ -341,14 +363,34 @@ for edgeDensity in "${EDs[@]}"; do
 				maxFreq=degFreq[d]; degMode=d
 			}
 			#printf " deg mean %g stdDev %g maxFreq %d degMode %d; pruning...", StatMean(""), StatStdDev(""), maxFreq, degMode > "/dev/stderr"
-			for(v in S) if(degreeInS[v] < StatMean("") - 3*StatStdDev("") || degreeInS[v] < degMode/3) {
-			    #printf " %s(%d)", v, degreeInS[v] > "/dev/stderr";
-			    delete S[v];
-			    edgeCount -= EdgesIntoS(v);
-			    wgtEdgeCount -= WgtEdgesIntoS(v);
+			PROCINFO["sorted_in"] = "@val_num_asc"; # for loop through in-degrees, smallest first
+			for(v in degreeInS) {
+			    if(degreeInS[v] < StatMean("") - 3*StatStdDev("") || degreeInS[v] < degMode/3) {
+				#printf " %s(%d)", v, degreeInS[v] > "/dev/stderr";
+				delete S[v];
+				edgeCount -= EdgesIntoS(v);
+				wgtEdgeCount -= WgtEdgesIntoS(v);
+			    }
 			}
 			#printf " |S|=%d", _statN[""] > "/dev/stderr"
 		    }
+		    tmpEdge = InducedEdges(edge,S, degreeInS); # this call populates degreeInS
+		    ASSERT(tmpEdge == edgeCount, "edgeCount "edgeCount" disagrees(1) with InducedEdges of "tmpEdge);
+		    PROCINFO["sorted_in"] = "@val_num_asc"; # for loop through in-degrees, smallest first
+		    for(v in degreeInS) {
+			if(length(S)<2) break;
+			if(edgeCount / choose(length(S),2) >= '$edgeDensity') break; # break once ED is above threshsold
+			delete S[v];
+			edgeCount -= EdgesIntoS(v);
+			wgtEdgeCount -= WgtEdgesIntoS(v);
+			tmpEdge = InducedEdges(edge,S, degreeInS); # this call populates degreeInS
+			ASSERT(tmpEdge == edgeCount, "edgeCount "edgeCount" disagrees(1) with InducedEdges of "tmpEdge);
+		    }
+		    if(length(S)>1) {
+			ed = edgeCount / choose(length(S),2);
+			WARN(ed >= '$edgeDensity',"hmmm, ed is "ed);
+		    }
+		    #printf " |S|=%d", _statN[""] > "/dev/stderr"
 		    Slen=length(S);
 		    if(Slen>=minClus && wgtEdgeCount/edgeCount>='$minEdgeMean') {
 			maxEdges=choose(Slen,2);
@@ -360,7 +402,6 @@ for edgeDensity in "${EDs[@]}"; do
 			for(u in S) {cluster[numClus][u]=1; printf " %s", u; StatAddSample("", degreeInS[u]);}
 			#printf "final |S|=%d mean %g stdDev %g min %d max %d:\n", _statN[""], StatMean(""), StatStdDev(""), StatMin(""), StatMax("") > "/dev/stderr"
 			print "";
-			if('$ONLY_ONE') exit;
 			# now mark as "started" the first half of S that was filled... or more generally, some fraction.
 			# We choose the top (1-OVERLAP) fraction because OVERLAP is meant to be less stringent as it
 			# approaches 1, which in the case of THIS loop means that if OVERLAP is close to 1, we want
@@ -371,9 +412,10 @@ for edgeDensity in "${EDs[@]}"; do
 		    #else print " REJECTED" > "/dev/stderr";
 		}
 	    }' "$TMPDIR/net4awk.el$W" - | # dash is the output of the above pipe (sorted cluster counts)
-	sort -nr |
+	sort -T $TMPDIR -nr |
 	hawk ' # attempt to remove duplicate clusters... not sure how intensive it is in RAM and CPU (yet)
 	    BEGIN{ numClus=0 } # post-process to only EXACT duplicates (more general removal later)
+	    FNR>1 && '$ONLY_ONE'{exit}
 	    {
 		delete S;
 		numNodes=$1
@@ -401,7 +443,7 @@ for edgeDensity in "${EDs[@]}"; do
 		}
 	    }
 	    ' | # sort by number of nodes, then by first node in the list:
-	sort $SUBFINAL_SORT > $TMPDIR/subfinal$k$edgeDensity.out & # sort by number of nodes, then by first node in the list
+	sort -T $TMPDIR $SUBFINAL_SORT > $TMPDIR/subfinal$k$edgeDensity.out & # sort by number of nodes, then by first node in the list
     done
     for k in "${Ks[@]}"; do
 	    wait; (( BLANT_EXIT_CODE += $? ))
@@ -409,7 +451,7 @@ for edgeDensity in "${EDs[@]}"; do
 done
 
 # we can use the --merge option because the subfinal files are already sorted in SUBFINAL_SORT order
-sort --merge $SUBFINAL_SORT $TMPDIR/subfinal*.out |
+sort -T $TMPDIR --merge $SUBFINAL_SORT $TMPDIR/subfinal*.out |
     hawk 'BEGIN{ numClus=0 } # post-process to remove/merge duplicates
 	{
 	    delete S;
@@ -449,12 +491,17 @@ sort --merge $SUBFINAL_SORT $TMPDIR/subfinal*.out |
 		maxEdges=choose(length(cluster[i]),2);
 		edgeMean = edgeSum[i]/edges[i];
 		ASSERT(edgeMean>='$minEdgeMean', "oops, should not get this far with an edgeMean of "edgeMean);
-		printf "%g clusterWeight, %g edgeSum, %g edgeMean, %d nodes, %d of %d edges from k %d %g%%:",
-		    edgeSum[i]/length(cluster[i]), edgeSum[i], edgeMean,
-		    length(cluster[i]), edges[i], maxEdges, kk[i], 100*edges[i]/maxEdges
-		for(u in cluster[i]) printf " %s", u
+		printf "%d nodes, %d/%d edges, %g%% density from k%d", length(cluster[i]), edges[i], maxEdges,
+		    100*edges[i]/maxEdges, k
+		if('$VERBOSE') printf " from k %d, %g clusterWeight, %g edgeSum, %g edgeMean", kk[i],
+		    edgeSum[i]/length(cluster[i]), edgeSum[i], edgeMean
+		if('$PRINT_MEMBERS') {
+		    printf ", nodeSet {"
+		    for(u in cluster[i]) printf " %s", u
+		    printf " }"
+		}
 		print ""
 	    }
-	}' | sort -k 5gr -k 1gr -k 7nr -k 16n # sort order: edgeMean, clusterWeight, number of nodes, nodeList
+	}' | sort -T $TMPDIR -k 1nr -k 3nr -k 9n # sort order: edge density, number of nodes, value of k
 #set -x
 exit $BLANT_EXIT_CODE

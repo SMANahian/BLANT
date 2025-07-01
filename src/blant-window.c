@@ -53,11 +53,12 @@ Gint_type combWindow2Int(int (*windowAdjList)[_windowSize], unsigned *Varray, un
         {
             if (windowAdjList[Varray[i]][Varray[j]] == 1)
             {
-                bit = (1 << bitPos);
+                bit = (1U << bitPos);
                 Gint |= bit;
                 *numEdges = *numEdges + 1;
             }
             bitPos++;
+	    assert(bitPos < int_width);
         }
     return Gint;
 }
@@ -66,7 +67,8 @@ void ProcessWindowDistribution(GRAPH *G, SET *V, unsigned Varray[], int k, TINY_
 {
     int num_difference;
     Gint_type Gint_prev_ordinal, Gint_curr_ordinal;
-    SampleGraphlet(G, V, Varray, k, G->n);
+    static Accumulators trash; // these values aren't used anywhere; but an accumulator must be passed in to SampleGraphlet
+    SampleGraphlet(G, V, Varray, k, G->n, &trash);
     SetIntersect(intersect_node, prev_node_set, V);
     num_difference = k - SetCardinality(intersect_node);
     SetEmpty(intersect_node);
@@ -80,7 +82,7 @@ void ProcessWindowDistribution(GRAPH *G, SET *V, unsigned Varray[], int k, TINY_
         Gint_prev_ordinal = L_K(TinyGraph2Int(prev_graph,k));
         TinyGraphInducedFromGraph(prev_graph, G, Varray);
         Gint_curr_ordinal = L_K(TinyGraph2Int(prev_graph,k));
-        _graphletDistributionTable[Gint_prev_ordinal][Gint_curr_ordinal] += 1;
+        _graphletDistributionTable[Gint_prev_ordinal][Gint_curr_ordinal] += 1; // segfault
     }
 }
 
@@ -394,32 +396,29 @@ void ProcessWindowRep(GRAPH *G, unsigned *VArray, int windowRepInt) {
     }
     _numWindowRep = _windowRep_limit_method ? limit_num : _numWindowRep;
 
-    switch(_outputMode)
-    {
-        case graphletFrequency:
-            _graphletCount[windowRepInt] += _numWindowRep;
-            break;
-        case indexGraphlets: case indexGraphletsRNO:
-            for(i=0; i<_windowSize; i++) PrintNode((i>0)*' ', VArray[i]);
-           	// printf("\n");
-            printf("\n%i %i\n", windowRepInt, _numWindowRep);
-            for(i=0; i<_numWindowRep; i++)
-            {
-                if(!((_windowRep_limit_method && NodeSetSeenRecently(G, _windowReps[limitIndex[i]], _k)) ||
-                    (!_windowRep_limit_method && NodeSetSeenRecently(G, _windowReps[i], _k))) ||
-                    _windowSampleMethod == WINDOW_SAMPLE_DEG_MAX)
-                {
-                        for(j=0; j<_k; j++)
-                        {
-                            if(_windowRep_limit_method)
-                                PrintNode((j>0)*' ',_windowReps[limitIndex[i]][j]);
-                            else
-                                PrintNode((j>0)*' ',_windowReps[i][j]);
-                        }
-                    printf("\n");
-                }
-            }
-            break;
-        default: Abort("ProcessWindowRep: unknown or un-implemented outputMode");
+    if(_outputMode & graphletFrequency) {
+	_graphletCount[windowRepInt] += _numWindowRep;
     }
+    if(_outputMode & indexGraphlets || _outputMode & indexGraphletsRNO) {
+	char buf[BUFSIZ];
+	for(i=0; i<_windowSize; i++) PrintNode(buf, (i>0)*' ', VArray[i]);
+	sprintf(buf+strlen(buf), "\n%i %i\n", windowRepInt, _numWindowRep);
+	for(i=0; i<_numWindowRep; i++)
+	{
+	    if(!((_windowRep_limit_method && NodeSetSeenRecently(G, _windowReps[limitIndex[i]], _k)) ||
+		(!_windowRep_limit_method && NodeSetSeenRecently(G, _windowReps[i], _k))) ||
+		_windowSampleMethod == WINDOW_SAMPLE_DEG_MAX)
+	    {
+		    for(j=0; j<_k; j++)
+		    {
+			if(_windowRep_limit_method)
+			    PrintNode(buf+strlen(buf), (j>0)*' ',_windowReps[limitIndex[i]][j]);
+			else
+			    PrintNode(buf+strlen(buf), (j>0)*' ',_windowReps[i][j]);
+		    }
+		printf("%s\n", buf);
+	    }
+	}
+    }
+    if(!_outputMode) Abort("ProcessWindowRep: unknown or un-implemented outputMode");
 }

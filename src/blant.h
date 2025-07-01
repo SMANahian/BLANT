@@ -1,9 +1,10 @@
 #ifndef BLANT_H
 #define BLANT_H
 
+#include <stdbool.h>
 #include "blant-fundamentals.h" // defining k related constants, including SELF_LOOPS
-
 #include "misc.h"
+#include "blant-pthreads.h"
 #include "sets.h"
 #include "tinygraph.h"
 #include "blant-window.h"
@@ -11,29 +12,14 @@
 #include "Oalloc.h"
 // #include "mem-debug.h" // need this if you use ENABLE_MEMORY_TRACKING() at the top of main().
 
-#define USE_MarsenneTwister 0
-#if USE_MarsenneTwister
-#include "libwayne/MT19937/mt19937.h"
-static MT19937 *_mt19937;
-#define RandomSeed SeedMt19937
-void SeedMt19937(int seed) {
-    if(_mt19937) Mt19937Free(_mt19937);
-    _mt19937 = Mt19937Alloc(seed);
-}
-double RandomUniform(void) {
-    return Mt19937NextDouble(_mt19937);
-}
-#else
-#include "rand48.h"
-#define RandomUniform drand48
-#define RandomSeed srand48
-#endif
+void RandomSeed(long seed);
+double RandomUniform(void);
 
 #define USE_INSERTION_SORT 0
 #define GEN_SYN_GRAPH 0
 
 #define MAX_POSSIBLE_THREADS 64 // set this to something reasonable on your machine (eg odin.ics.uci.edu has 64 cores)
-extern int _JOBS, _MAX_THREADS;
+extern int _numThreads, _maxThreads;
 extern unsigned long _numSamples;
 extern double _confidence; // for confidence intervals
 extern Boolean _earlyAbort;  // Can be set true by anybody anywhere, and they're responsible for producing a warning as to why
@@ -90,6 +76,7 @@ extern char _canonNumEdges[MAX_CANONICALS];
 extern double _totalStarMotifs;
 extern Gint_type _canonList[MAX_CANONICALS];
 
+void SetBlantDirs(void);
 double GetCPUseconds(void);
 void Int2TinyGraph(TINY_GRAPH* G, Gint_type Gint);
 Gint_type TinyGraph2Int(TINY_GRAPH *g, int numNodes);
@@ -100,19 +87,19 @@ Gint_type orbitListPopulate(char *BUF, Gint_type orbit_list[MAX_CANONICALS][MAX_
 void orcaOrbitMappingPopulate(char *BUF, int orca_orbit_mapping[58], int k);
 char** convertToEL(char* file); // from convert.cpp
 
-#define CANON_DIR "canon_maps"
-//#define CANON_DIR "/var/preserve/Graphette/canon_maps" // if you happen to put it there...
-
 #define DEFAULT_BLANT_DIR "."
-extern const char* _BLANT_DIR;
+#define DEFAULT_CANON_DIR "canon_maps"
+extern const char* _BLANT_DIR, *_CANON_DIR;
 
 extern double *_graphletDegreeVector[MAX_CANONICALS];
-extern double       *_orbitDegreeVector[MAX_ORBITS];
-extern double *_doubleGraphletDegreeVector[MAX_CANONICALS];
-extern double *_doubleOrbitDegreeVector[MAX_ORBITS], _absoluteCountMultiplier;
+extern double *_orbitDegreeVector[MAX_ORBITS], _absoluteCountMultiplier;
 
 // If you're squeemish then use this one to access the degrees:
-#define ODV(node,orbit)       _orbitDegreeVector[orbit][node]
+// THESE NEED TO BE WHOLLY DEPRECATED TO WORK SAFELY WITH MULTITHREADING.
+// UTILIZING THESE ACCESSES THE GLOBAL VARIABLES, NOT THE THREAD LOCAL ACCUMULATOR VALUES
+// THUS IF IN THE SAMPLING PROCESS YOU CALL THESE (AS IT DOES IN ProcessNodeGraphletNeighbors, WHICH MUST BE FIXED))
+// INACCURATE RESULTS WILL BE RETURNED
+#define ODV(node,orbit)          _orbitDegreeVector[orbit][node]
 #define GDV(node,graphlet) _graphletDegreeVector[graphlet][node]
 
 // Enable the code that uses C++ to parse input files?
@@ -136,11 +123,12 @@ extern SET *_connectedCanonicals;
 extern SET ***_communityNeighbors;
 extern char _communityMode; // 'g' for graphlet or 'o' for orbit; default ???
 
-enum OutputMode {undef, indexGraphlets, indexGraphletsRNO, indexOrbits, indexMotifs, communityDetection,
-    indexMotifOrbits, predict, predict_merge, graphletFrequency, outputODV, outputGDV,
-    graphletDistribution // used in Windowing
+// Use POWERS OF 2 so we can combine them.
+enum OutputMode {undef=0, indexGraphlets=1, indexGraphletsRNO=2, indexOrbits=4, indexMotifs=8, communityDetection=16,
+    indexMotifOrbits=32, predict=64, predict_merge=128, graphletFrequency=256, outputODV=512, outputGDV=1024,
+    graphletDistribution=2048 // used in Windowing
 };
-extern enum OutputMode _outputMode;
+extern enum OutputMode _outputMode; // note they can be LOGINAL OR'd together; modes can overlap!
 extern int _outputMapping[MAX_CANONICALS], _canonNumStarMotifs[MAX_CANONICALS];
 
 extern double _graphletCount[MAX_CANONICALS];
@@ -174,9 +162,16 @@ extern SET *_startNodeSet;
 extern double *_cumulativeProb;
 extern Boolean _child, _weighted;
 extern Boolean _rawCounts;
+extern int _quiet; // suppress notes and/or warnings, higher value = more quiet
 
 #define SPARSE true // do not try false at the moment, it's broken
 
 Boolean NodeSetSeenRecently(GRAPH *G, unsigned Varray[], int k);
+
+// keeps track of if the stop mode is specified with number of samples (-n) or precision (-p)
+enum StopMode {stopOnSamples, stopOnPrecision};
+extern enum StopMode _stopMode;
+
+void* RunBlantInThread(void* arg);
 
 #endif
